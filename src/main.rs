@@ -95,8 +95,8 @@ fn main() {
             if i > 0 { print!("\t"); }
             if columns[i].value.is_empty() { print!("\\N"); }
             else {
-              if columns[i].search != None && columns[i].replace != None {
-                columns[i].value = columns[i].value.replace(columns[i].search.unwrap(), columns[i].replace.unwrap());
+              if let (Some(s), Some(r)) = (columns[i].search, columns[i].replace) {
+                columns[i].value = columns[i].value.replace(s, r);
               }
               print!("{}", columns[i].value);
               columns[i].value.clear();
@@ -111,8 +111,8 @@ fn main() {
           for i in 0..columns.len() {
             if path == columns[i].path {
               raw = false;
-              if columns[i].search != None && columns[i].replace != None {
-                rawstr = rawstr.replace(columns[i].search.unwrap(), columns[i].replace.unwrap());
+              if let (Some(s), Some(r)) = (columns[i].search, columns[i].replace) {
+                rawstr = rawstr.replace(s, r);
               }
               columns[i].value.push_str(&rawstr);
               rawstr.clear();
