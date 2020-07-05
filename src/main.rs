@@ -9,10 +9,12 @@ use quick_xml::events::Event;
 use yaml_rust::YamlLoader;
 
 #[derive(Debug)]
-struct Column {
+struct Column<'a> {
   name: String,
   path: String,
   value: String,
+  search: Option<&'a str>,
+  replace: Option<&'a str>,
   raw: bool
 }
 
@@ -41,14 +43,16 @@ fn main() {
   let mut columns = Vec::new();
 
   for col in colspec {
-    let name = col["name"].as_str().unwrap();
+    let name = col["name"].as_str().expect("Column has no 'name' entry in configuration file");
+    let search = col["search"].as_str();
+    let replace = col["replace"].as_str();
     let mut raw = false;
     if !col["raw"].is_badvalue() { raw = col["raw"].as_bool().unwrap() }
     let colpath = col["path"].as_str().unwrap();
-//    println!("Column name {} path {}", name, colpath);
+//    if search != None && replace != None { eprintln!("Column name {} search {} replace {}", name, search.unwrap(), replace.unwrap()); }
     let mut path = String::from(rowpath);
     path.push_str(colpath);
-    columns.push(Column { name: name.to_string(), path: path, value: String::new(), raw: raw });
+    columns.push(Column { name: name.to_string(), path, value: String::new(), search, replace, raw });
   }
 
   let mut raw = false;
@@ -81,7 +85,7 @@ fn main() {
         }
         for i in 0..columns.len() {
           if path == columns[i].path {
-            columns[i].value.push_str(&e.unescape_and_decode(&reader).unwrap());
+            columns[i].value.push_str(&e.unescape_and_decode(&reader).unwrap().replace("\\", "\\\\"));
           }
         }
       },
@@ -91,6 +95,9 @@ fn main() {
             if i > 0 { print!("\t"); }
             if columns[i].value.is_empty() { print!("\\N"); }
             else {
+              if columns[i].search != None && columns[i].replace != None {
+                columns[i].value = columns[i].value.replace(columns[i].search.unwrap(), columns[i].replace.unwrap());
+              }
               print!("{}", columns[i].value);
               columns[i].value.clear();
             }
@@ -104,6 +111,9 @@ fn main() {
           for i in 0..columns.len() {
             if path == columns[i].path {
               raw = false;
+              if columns[i].search != None && columns[i].replace != None {
+                rawstr = rawstr.replace(columns[i].search.unwrap(), columns[i].replace.unwrap());
+              }
               columns[i].value.push_str(&rawstr);
               rawstr.clear();
               break;
