@@ -25,6 +25,10 @@ struct Geometry {
   pos: Vec<f64>
 }
 
+struct Ring {
+  pos: Vec<f64>
+}
+
 fn geom_to_ewkb(geom: Geometry) -> Vec<u8> {
   let mut ewkb = Vec::new();
   ewkb.push(1);
@@ -78,11 +82,10 @@ fn main() {
   let mut text = String::new();
   let mut gmltoewkb = false;
   let mut gmlsrid: u32 = 4326;
-  let mut gmlrings: u32 = 0;
+  let mut gmlrings: Vec<Ring> = Vec::new();
   let mut gmldims: u8 = 2;
   let mut gmlpos = false;
-  let mut gmlposlist: Vec<f64> = Vec::new();
-  let mut ewkb: Vec<u8> = vec![1];
+  let mut ewkb: Vec<u8> = Vec::new();
   loop {
     match reader.read_event(&mut buf) {
       Ok(Event::Start(ref e)) => {
@@ -128,22 +131,9 @@ fn main() {
               "gml:LineString" => ewkb.push(2),
               "gml:Polygon" => ewkb.push(3),
               "gml:exterior" => (),
-              "gml:LinearRing" => gmlrings += 1,
-              "gml:posList" => {
-                gmlpos = true;
-                ewkb.push(0);
-                ewkb.push(0);
-                let code = match gmldims {
-                  2 => 32,
-                  3 => 32 | 128,
-                  _ => {
-                    eprintln!("GML number of dimensions {} not supported", gmldims);
-                    32
-                  }
-                };
-                ewkb.push(code);
-                ewkb.extend_from_slice(&gmlsrid.to_le_bytes());
-              }
+              "gml:interior" => (),
+              "gml:LinearRing" => gmlrings.push(Ring { pos: Vec::new() } ),
+              "gml:posList" => gmlpos = true,
               _ => eprintln!("GML type {} not supported", tag)
             }
           }
@@ -158,7 +148,10 @@ fn main() {
               match columns[i].convert {
                 None => (),
                 Some("xml-to-text") => xmltotext = true,
-                Some("gml-to-ewkb") => gmltoewkb = true,
+                Some("gml-to-ewkb") => {
+                  gmltoewkb = true;
+                  ewkb.push(1);
+                }
                 Some(_) => (),
               }
               break;
@@ -175,7 +168,7 @@ fn main() {
           if gmlpos {
             let value = String::from(&e.unescape_and_decode(&reader).unwrap());
             for pos in value.split(' ') {
-              gmlposlist.push(pos.parse().unwrap());
+              gmlrings.last_mut().unwrap().pos.push(pos.parse().unwrap());
             }
           }
           continue;
@@ -221,16 +214,30 @@ fn main() {
           for i in 0..columns.len() {
             if path == columns[i].path {
               gmltoewkb = false;
-              ewkb.extend_from_slice(&gmlrings.to_le_bytes());
-              ewkb.extend_from_slice(&((gmlposlist.len() as u32)/gmldims as u32).to_le_bytes());
-              for pos in gmlposlist.iter() {
-                ewkb.extend_from_slice(&pos.to_le_bytes());
+              ewkb.push(0);
+              ewkb.push(0);
+              let code = match gmldims {
+                2 => 32,
+                3 => 32 | 128,
+                _ => {
+                  eprintln!("GML number of dimensions {} not supported", gmldims);
+                  32
+                }
+              };
+              ewkb.push(code);
+              ewkb.extend_from_slice(&gmlsrid.to_le_bytes());
+              ewkb.extend_from_slice(&(gmlrings.len() as u32).to_le_bytes());
+              for ring in gmlrings.iter() {
+                ewkb.extend_from_slice(&((ring.pos.len() as u32)/gmldims as u32).to_le_bytes());
+                for pos in ring.pos.iter() {
+                  ewkb.extend_from_slice(&pos.to_le_bytes());
+                }
               }
               for byte in ewkb.iter() {
                 columns[i].value.push_str(&format!("{:02X}", byte));
               }
               ewkb.clear();
-              gmlposlist.clear();
+              gmlrings.clear();
               break;
             }
           }
