@@ -5,6 +5,7 @@ use std::io::{Read, Write, stdout};
 use std::fs::File;
 use std::path::Path;
 use std::env;
+use std::cell::RefCell;
 use std::time::Instant;
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -13,30 +14,34 @@ use yaml_rust::yaml::Yaml;
 
 struct Table<'a> {
   path: String,
-  file: Box<dyn Write>,
+  file: RefCell<Box<dyn Write>>,
   columns: Vec<Column<'a>>
 }
 impl<'a> Table<'a> {
-  fn new<'b>(path: &str, file: Option<&str>) -> Table<'b> {
+  fn new(path: &str, file: Option<&str>) -> Table<'a> {
     Table {
       path: String::from(path),
       file: match file {
-        None => Box::new(stdout()),
-        Some(ref file) => Box::new(File::create(&Path::new(file)).unwrap())
+        None => RefCell::new(Box::new(stdout())),
+        Some(ref file) => RefCell::new(Box::new(File::create(&Path::new(file)).unwrap()))
       },
       columns: Vec::new()
     }
+  }
+  fn write(&self, text: &str) {
+    self.file.borrow_mut().write_all(&text.as_bytes()).expect("Write error encountered; exiting...");
   }
 }
 
 struct Column<'a> {
   name: String,
   path: String,
-  value: String,
+  value: RefCell<String>,
   convert: Option<&'a str>,
   search: Option<&'a str>,
   replace: Option<&'a str>,
-  consol: Option<&'a str>
+  consol: Option<&'a str>,
+  subtable: Option<Table<'a>>
 }
 
 struct Geometry {
@@ -57,7 +62,7 @@ impl Geometry {
   }
 }
 
-fn gml_to_ewkb(value: &mut String, geom: &Geometry) {
+fn gml_to_ewkb(cell: &RefCell<String>, geom: &Geometry) {
   let mut ewkb = vec![1, geom.gtype, 0, 0];
   let code = match geom.dims {
     2 => 32,
@@ -76,25 +81,33 @@ fn gml_to_ewkb(value: &mut String, geom: &Geometry) {
       ewkb.extend_from_slice(&pos.to_le_bytes());
     }
   }
+  let mut value = cell.borrow_mut();
   for byte in ewkb.iter() {
     value.push_str(&format!("{:02X}", byte));
   }
 }
 
-fn add_table<'a>(tables: &mut Vec<Table<'a>>, rowpath: &str, outfile: Option<&str>, colspec: &'a Vec<Yaml>) {
-  tables.push(Table::new(rowpath, outfile));
-  let table = tables.last_mut().unwrap();
+fn add_table<'a>(rowpath: &str, outfile: Option<&str>, colspec: &'a Vec<Yaml>) -> Table<'a> {
+  let mut table = Table::new(rowpath, outfile);
   for col in colspec {
     let name = col["name"].as_str().expect("Column has no 'name' entry in configuration file");
     let colpath = col["path"].as_str().expect("Column has no 'path' entry in configuration file");
+    let mut path = String::from(rowpath);
+    path.push_str(colpath);
+    let subtable: Option<Table> = match col["cols"].is_badvalue() {
+      true => None,
+      false => {
+        let file = col["file"].as_str().expect("Subtable has no 'file' entry");
+        Some(add_table(&path, Some(&file), col["cols"].as_vec().expect("Subtable 'cols' entry is not an array")))
+      }
+    };
     let convert = col["convert"].as_str();
     let search = col["search"].as_str();
     let replace = col["replace"].as_str();
     let consol = col["consol"].as_str();
-    let mut path = String::from(rowpath);
-    path.push_str(colpath);
-    table.columns.push(Column { name: name.to_string(), path, value: String::new(), convert, search, replace, consol });
+    table.columns.push(Column { name: name.to_string(), path, value: RefCell::new(String::new()), convert, search, replace, consol, subtable });
   }
+  table
 }
 
 fn main() -> std::io::Result<()> {
@@ -104,9 +117,11 @@ fn main() -> std::io::Result<()> {
     return Ok(());
   }
 
-  let mut config_str = String::new();
-  File::open(&args[1]).unwrap().read_to_string(&mut config_str).unwrap();
-  let config = &YamlLoader::load_from_str(&config_str).unwrap()[0];
+  let config = {
+    let mut config_str = String::new();
+    File::open(&args[1]).unwrap().read_to_string(&mut config_str).unwrap();
+    &YamlLoader::load_from_str(&config_str).unwrap()[0]
+  };
 
   let mut reader;
   reader = Reader::from_file(&args[2]).unwrap();
@@ -119,9 +134,9 @@ fn main() -> std::io::Result<()> {
   let rowpath = config["path"].as_str().expect("No valid 'rowpath' entry in configuration file");
   let colspec = config["cols"].as_vec().expect("No valid 'columns' array in configuration file");
   let outfile = config["file"].as_str();
-  let mut tables: Vec<Table> = Vec::new();
-  add_table(&mut tables, rowpath, outfile, colspec);
-  let table = tables.first_mut().unwrap();
+  let maintable = add_table(rowpath, outfile, colspec);
+  let mut tables: Vec<&Table> = Vec::new();
+  let mut table = &maintable;
 
   let mut xmltotext = false;
   let mut text = String::new();
@@ -188,6 +203,11 @@ fn main() -> std::io::Result<()> {
         else if path.len() > table.path.len() {
           for i in 0..table.columns.len() {
             if path == table.columns[i].path {
+              if table.columns[i].subtable.is_some() {
+                tables.push(table);
+                table = &table.columns[i].subtable.as_ref().unwrap();
+                break;
+              }
               match table.columns[i].convert {
                 None => (),
                 Some("xml-to-text") => xmltotext = true,
@@ -217,38 +237,44 @@ fn main() -> std::io::Result<()> {
           if path == table.columns[i].path {
             match table.columns[i].consol {
               None => {
-                if !table.columns[i].value.is_empty() {
+                if !table.columns[i].value.borrow().is_empty() {
                   eprintln!("Column '{}' has multiple occurrences without a consolidation method; using 'first'", table.columns[i].name);
                   break;
                 }
               },
               Some("append") => {
-                if !table.columns[i].value.is_empty() { table.columns[i].value.push(','); }
+                if !table.columns[i].value.borrow().is_empty() { table.columns[i].value.borrow_mut().push(','); }
               },
               Some(s) => {
                 eprintln!("Column '{}' has invalid consolidation method {}", table.columns[i].name, s);
                 break;
               }
             }
-            table.columns[i].value.push_str(&e.unescape_and_decode(&reader).unwrap().replace("\\", "\\\\"));
+            table.columns[i].value.borrow_mut().push_str(&e.unescape_and_decode(&reader).unwrap().replace("\\", "\\\\"));
             break;
           }
         }
       },
       Ok(Event::End(_)) => {
         if path == table.path {
+          if !tables.is_empty() {
+            table.write(&tables.last().unwrap().columns[0].value.borrow());
+            table.write("\t");
+          }
           for i in 0..table.columns.len() {
-            if i > 0 { write!(table.file, "\t")?; }
-            if table.columns[i].value.is_empty() { write!(table.file, "\\N")?; }
+            if i > 0 { table.write("\t"); }
+            if table.columns[i].value.borrow().is_empty() { table.write("\\N"); }
             else {
               if let (Some(s), Some(r)) = (table.columns[i].search, table.columns[i].replace) {
-                table.columns[i].value = table.columns[i].value.replace(s, r);
+                let mut value = table.columns[i].value.borrow_mut();
+                *value = value.replace(s, r);
               }
-              write!(table.file, "{}", table.columns[i].value)?;
-              table.columns[i].value.clear();
+              table.write(&table.columns[i].value.borrow());
+              table.columns[i].value.borrow_mut().clear();
             }
           }
-          writeln!(table.file)?;
+          table.write("\n");
+          if !tables.is_empty() { table = tables.pop().unwrap(); }
         }
         let i = path.rfind('/').unwrap();
         let tag = path.split_off(i);
@@ -260,7 +286,7 @@ fn main() -> std::io::Result<()> {
               if let (Some(s), Some(r)) = (table.columns[i].search, table.columns[i].replace) {
                 text = text.replace(s, r);
               }
-              table.columns[i].value.push_str(&text);
+              table.columns[i].value.borrow_mut().push_str(&text);
               text.clear();
               break;
             }
@@ -270,7 +296,7 @@ fn main() -> std::io::Result<()> {
           for i in 0..table.columns.len() {
             if path == table.columns[i].path {
               gmltoewkb = false;
-              gml_to_ewkb(&mut table.columns[i].value, &gmlgeom);
+              gml_to_ewkb(&table.columns[i].value, &gmlgeom);
               gmlgeom.reset();
               break;
             }
