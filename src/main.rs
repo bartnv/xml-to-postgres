@@ -1,15 +1,34 @@
 extern crate quick_xml;
 extern crate yaml_rust;
 
-use std::io::Read;
+use std::io::{Read, Write, stdout};
 use std::fs::File;
+use std::path::Path;
 use std::env;
 use std::time::Instant;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use yaml_rust::YamlLoader;
+use yaml_rust::yaml::Yaml;
 
-#[derive(Debug)]
+struct Table<'a> {
+  path: String,
+  file: Box<dyn Write>,
+  columns: Vec<Column<'a>>
+}
+impl<'a> Table<'a> {
+  fn new<'b>(path: &str, file: Option<&str>) -> Table<'b> {
+    Table {
+      path: String::from(path),
+      file: match file {
+        None => Box::new(stdout()),
+        Some(ref file) => Box::new(File::create(&Path::new(file)).unwrap())
+      },
+      columns: Vec::new()
+    }
+  }
+}
+
 struct Column<'a> {
   name: String,
   path: String,
@@ -17,6 +36,7 @@ struct Column<'a> {
   convert: Option<&'a str>,
   search: Option<&'a str>,
   replace: Option<&'a str>,
+  consol: Option<&'a str>
 }
 
 struct Geometry {
@@ -61,11 +81,27 @@ fn gml_to_ewkb(value: &mut String, geom: &Geometry) {
   }
 }
 
-fn main() {
+fn add_table<'a>(tables: &mut Vec<Table<'a>>, rowpath: &str, outfile: Option<&str>, colspec: &'a Vec<Yaml>) {
+  tables.push(Table::new(rowpath, outfile));
+  let table = tables.last_mut().unwrap();
+  for col in colspec {
+    let name = col["name"].as_str().expect("Column has no 'name' entry in configuration file");
+    let colpath = col["path"].as_str().expect("Column has no 'path' entry in configuration file");
+    let convert = col["convert"].as_str();
+    let search = col["search"].as_str();
+    let replace = col["replace"].as_str();
+    let consol = col["consol"].as_str();
+    let mut path = String::from(rowpath);
+    path.push_str(colpath);
+    table.columns.push(Column { name: name.to_string(), path, value: String::new(), convert, search, replace, consol });
+  }
+}
+
+fn main() -> std::io::Result<()> {
   let args: Vec<_> = env::args().collect();
   if args.len() != 3 {
     eprintln!("usage: {} <configfile> <xmlfile>", args[0]);
-    return;
+    return Ok(());
   }
 
   let mut config_str = String::new();
@@ -78,23 +114,14 @@ fn main() {
 
   let mut path = String::new();
   let mut buf = Vec::new();
-
   let mut count = 0;
 
-  let rowpath = config["rowpath"].as_str().expect("No valid 'rowpath' entry in configuration file");
-  let colspec = config["columns"].as_vec().expect("No valid 'columns' array in configuration file");
-  let mut columns = Vec::new();
-
-  for col in colspec {
-    let name = col["name"].as_str().expect("Column has no 'name' entry in configuration file");
-    let colpath = col["path"].as_str().expect("Column has no 'path' entry in configuration file");
-    let convert = col["convert"].as_str();
-    let search = col["search"].as_str();
-    let replace = col["replace"].as_str();
-    let mut path = String::from(rowpath);
-    path.push_str(colpath);
-    columns.push(Column { name: name.to_string(), path, value: String::new(), convert, search, replace });
-  }
+  let rowpath = config["path"].as_str().expect("No valid 'rowpath' entry in configuration file");
+  let colspec = config["cols"].as_vec().expect("No valid 'columns' array in configuration file");
+  let outfile = config["file"].as_str();
+  let mut tables: Vec<Table> = Vec::new();
+  add_table(&mut tables, rowpath, outfile, colspec);
+  let table = tables.first_mut().unwrap();
 
   let mut xmltotext = false;
   let mut text = String::new();
@@ -155,13 +182,13 @@ fn main() {
           }
           continue;
         }
-        else if path == rowpath {
+        else if path == table.path {
           count += 1;
         }
-        else if path.len() > rowpath.len() {
-          for i in 0..columns.len() {
-            if path == columns[i].path {
-              match columns[i].convert {
+        else if path.len() > table.path.len() {
+          for i in 0..table.columns.len() {
+            if path == table.columns[i].path {
+              match table.columns[i].convert {
                 None => (),
                 Some("xml-to-text") => xmltotext = true,
                 Some("gml-to-ewkb") => gmltoewkb = true,
@@ -186,48 +213,64 @@ fn main() {
           }
           continue;
         }
-        for i in 0..columns.len() {
-          if path == columns[i].path {
-            columns[i].value.push_str(&e.unescape_and_decode(&reader).unwrap().replace("\\", "\\\\"));
+        for i in 0..table.columns.len() {
+          if path == table.columns[i].path {
+            match table.columns[i].consol {
+              None => {
+                if !table.columns[i].value.is_empty() {
+                  eprintln!("Column '{}' has multiple occurrences without a consolidation method; using 'first'", table.columns[i].name);
+                  break;
+                }
+              },
+              Some("append") => {
+                if !table.columns[i].value.is_empty() { table.columns[i].value.push(','); }
+              },
+              Some(s) => {
+                eprintln!("Column '{}' has invalid consolidation method {}", table.columns[i].name, s);
+                break;
+              }
+            }
+            table.columns[i].value.push_str(&e.unescape_and_decode(&reader).unwrap().replace("\\", "\\\\"));
+            break;
           }
         }
       },
       Ok(Event::End(_)) => {
-        if path == rowpath {
-          for i in 0..columns.len() {
-            if i > 0 { print!("\t"); }
-            if columns[i].value.is_empty() { print!("\\N"); }
+        if path == table.path {
+          for i in 0..table.columns.len() {
+            if i > 0 { write!(table.file, "\t")?; }
+            if table.columns[i].value.is_empty() { write!(table.file, "\\N")?; }
             else {
-              if let (Some(s), Some(r)) = (columns[i].search, columns[i].replace) {
-                columns[i].value = columns[i].value.replace(s, r);
+              if let (Some(s), Some(r)) = (table.columns[i].search, table.columns[i].replace) {
+                table.columns[i].value = table.columns[i].value.replace(s, r);
               }
-              print!("{}", columns[i].value);
-              columns[i].value.clear();
+              write!(table.file, "{}", table.columns[i].value)?;
+              table.columns[i].value.clear();
             }
           }
-          println!("");
+          writeln!(table.file)?;
         }
         let i = path.rfind('/').unwrap();
         let tag = path.split_off(i);
         if xmltotext {
           text.push_str(&format!("<{}>", tag));
-          for i in 0..columns.len() {
-            if path == columns[i].path {
+          for i in 0..table.columns.len() {
+            if path == table.columns[i].path {
               xmltotext = false;
-              if let (Some(s), Some(r)) = (columns[i].search, columns[i].replace) {
+              if let (Some(s), Some(r)) = (table.columns[i].search, table.columns[i].replace) {
                 text = text.replace(s, r);
               }
-              columns[i].value.push_str(&text);
+              table.columns[i].value.push_str(&text);
               text.clear();
               break;
             }
           }
         }
         else if gmltoewkb {
-          for i in 0..columns.len() {
-            if path == columns[i].path {
+          for i in 0..table.columns.len() {
+            if path == table.columns[i].path {
               gmltoewkb = false;
-              gml_to_ewkb(&mut columns[i].value, &gmlgeom);
+              gml_to_ewkb(&mut table.columns[i].value, &gmlgeom);
               gmlgeom.reset();
               break;
             }
@@ -241,4 +284,5 @@ fn main() {
     buf.clear();
   }
   eprintln!("{} rows processed in {} seconds", count, start.elapsed().as_secs());
+  Ok(())
 }
