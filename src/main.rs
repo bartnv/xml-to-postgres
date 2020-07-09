@@ -4,6 +4,7 @@ extern crate yaml_rust;
 use std::io::Read;
 use std::fs::File;
 use std::env;
+use std::time::Instant;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use yaml_rust::YamlLoader;
@@ -86,6 +87,7 @@ fn main() {
   let mut gmldims: u8 = 2;
   let mut gmlpos = false;
   let mut ewkb: Vec<u8> = Vec::new();
+  let start = Instant::now();
   loop {
     match reader.read_event(&mut buf) {
       Ok(Event::Start(ref e)) => {
@@ -249,5 +251,5 @@ fn main() {
     }
     buf.clear();
   }
-  eprintln!("{} rows processed", count);
+  eprintln!("{} rows processed in {} seconds", count, start.elapsed().as_secs());
 }
