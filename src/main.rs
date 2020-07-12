@@ -37,11 +37,21 @@ struct Column<'a> {
   name: String,
   path: String,
   value: RefCell<String>,
+  attr: Option<&'a str>,
   convert: Option<&'a str>,
   search: Option<&'a str>,
   replace: Option<&'a str>,
   consol: Option<&'a str>,
   subtable: Option<Table<'a>>
+}
+impl std::fmt::Debug for Column<'_> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Column")
+      .field("name", &self.name)
+      .field("path", &self.path)
+      .field("attr", &self.attr)
+      .finish()
+  }
 }
 
 struct Geometry {
@@ -101,11 +111,13 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, colspec: &'a Vec<Yaml>) -
         Some(add_table(&path, Some(&file), col["cols"].as_vec().expect("Subtable 'cols' entry is not an array")))
       }
     };
+    let attr = col["attr"].as_str();
     let convert = col["convert"].as_str();
     let search = col["search"].as_str();
     let replace = col["replace"].as_str();
     let consol = col["consol"].as_str();
-    table.columns.push(Column { name: name.to_string(), path, value: RefCell::new(String::new()), convert, search, replace, consol, subtable });
+    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, convert, search, replace, consol, subtable };
+    table.columns.push(column);
   }
   table
 }
@@ -125,7 +137,8 @@ fn main() -> std::io::Result<()> {
 
   let mut reader;
   reader = Reader::from_file(&args[2]).unwrap();
-  reader.trim_text(true);
+  reader.trim_text(true)
+        .expand_empty_elements(true);
 
   let mut path = String::new();
   let mut buf = Vec::new();
@@ -208,6 +221,26 @@ fn main() -> std::io::Result<()> {
                 table = &table.columns[i].subtable.as_ref().unwrap();
                 break;
               }
+              if let Some(request) = table.columns[i].attr {
+                for res in e.attributes() {
+                  if let Ok(attr) = res {
+                    if let Ok(key) = reader.decode(attr.key) {
+                      if key == request {
+                        if let Ok(value) = reader.decode(&attr.value) {
+                          table.columns[i].value.borrow_mut().push_str(value)
+                        }
+                        else { eprintln!("Failed to decode attribute {} for column {}", request, table.columns[i].name); }
+                        break;
+                      }
+                    }
+                    else { eprintln!("Failed to decode an attribute for column {}", table.columns[i].name); }
+                  }
+                  else { eprintln!("Error reading attributes for column {}", table.columns[i].name); }
+                }
+                if table.columns[i].value.borrow().is_empty() {
+                  eprintln!("Column {} requested attribute {} not found", table.columns[i].name, request);
+                }
+              }
               match table.columns[i].convert {
                 None => (),
                 Some("xml-to-text") => xmltotext = true,
@@ -235,6 +268,7 @@ fn main() -> std::io::Result<()> {
         }
         for i in 0..table.columns.len() {
           if path == table.columns[i].path {
+            if table.columns[i].attr.is_some() { break; }
             match table.columns[i].consol {
               None => {
                 if !table.columns[i].value.borrow().is_empty() {
