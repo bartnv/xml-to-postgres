@@ -9,5 +9,5 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-quick-xml = "0.18"
+quick-xml = "0.20"
 yaml-rust = "0.4"
