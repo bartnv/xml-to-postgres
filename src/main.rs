@@ -39,7 +39,7 @@ struct Column<'a> {
   value: RefCell<String>,
   attr: Option<&'a str>,
   convert: Option<&'a str>,
-  search: Option<&'a str>,
+  find: Option<&'a str>,
   replace: Option<&'a str>,
   consol: Option<&'a str>,
   subtable: Option<Table<'a>>
@@ -97,7 +97,7 @@ fn gml_to_ewkb(cell: &RefCell<String>, geom: &Geometry) {
   }
 }
 
-fn add_table<'a>(rowpath: &str, outfile: Option<&str>, colspec: &'a Vec<Yaml>) -> Table<'a> {
+fn add_table<'a>(rowpath: &str, outfile: Option<&str>, colspec: &'a [Yaml]) -> Table<'a> {
   let mut table = Table::new(rowpath, outfile);
   for col in colspec {
     let name = col["name"].as_str().expect("Column has no 'name' entry in configuration file");
@@ -112,11 +112,11 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, colspec: &'a Vec<Yaml>) -
       }
     };
     let attr = col["attr"].as_str();
-    let convert = col["convert"].as_str();
-    let search = col["search"].as_str();
-    let replace = col["replace"].as_str();
-    let consol = col["consol"].as_str();
-    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, convert, search, replace, consol, subtable };
+    let convert = col["conv"].as_str();
+    let find = col["find"].as_str();
+    let replace = col["repl"].as_str();
+    let consol = col["cons"].as_str();
+    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, convert, find, replace, consol, subtable };
     table.columns.push(column);
   }
   table
@@ -144,8 +144,8 @@ fn main() -> std::io::Result<()> {
   let mut buf = Vec::new();
   let mut count = 0;
 
-  let rowpath = config["path"].as_str().expect("No valid 'rowpath' entry in configuration file");
-  let colspec = config["cols"].as_vec().expect("No valid 'columns' array in configuration file");
+  let rowpath = config["path"].as_str().expect("No valid 'path' entry in configuration file");
+  let colspec = config["cols"].as_vec().expect("No valid 'cols' array in configuration file");
   let outfile = config["file"].as_str();
   let maintable = add_table(rowpath, outfile, colspec);
   let mut tables: Vec<&Table> = Vec::new();
@@ -299,7 +299,7 @@ fn main() -> std::io::Result<()> {
             if i > 0 { table.write("\t"); }
             if table.columns[i].value.borrow().is_empty() { table.write("\\N"); }
             else {
-              if let (Some(s), Some(r)) = (table.columns[i].search, table.columns[i].replace) {
+              if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
                 let mut value = table.columns[i].value.borrow_mut();
                 *value = value.replace(s, r);
               }
@@ -317,7 +317,7 @@ fn main() -> std::io::Result<()> {
           for i in 0..table.columns.len() {
             if path == table.columns[i].path {
               xmltotext = false;
-              if let (Some(s), Some(r)) = (table.columns[i].search, table.columns[i].replace) {
+              if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
                 text = text.replace(s, r);
               }
               table.columns[i].value.borrow_mut().push_str(&text);
