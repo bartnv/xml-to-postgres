@@ -215,12 +215,16 @@ fn main() -> std::io::Result<()> {
         }
         else if path.len() > table.path.len() {
           for i in 0..table.columns.len() {
-            if path == table.columns[i].path {
+            if path == table.columns[i].path { // This start tag matches one of the defined columns
+
+              // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
               if table.columns[i].subtable.is_some() {
                 tables.push(table);
                 table = &table.columns[i].subtable.as_ref().unwrap();
                 break;
               }
+
+              // Handle the 'attr' case where the content is read from an attribute of this tag
               if let Some(request) = table.columns[i].attr {
                 for res in e.attributes() {
                   if let Ok(attr) = res {
@@ -241,6 +245,8 @@ fn main() -> std::io::Result<()> {
                   eprintln!("Column {} requested attribute {} not found", table.columns[i].name, request);
                 }
               }
+
+              // Set the appropriate convert flag for the following data in case the 'conv' option is present
               match table.columns[i].convert {
                 None => (),
                 Some("xml-to-text") => xmltotext = true,
@@ -291,11 +297,16 @@ fn main() -> std::io::Result<()> {
       },
       Ok(Event::End(_)) => {
         if path == table.path {
+
+          // End tag of a subtable; write the first column value of the parent table as the first column of the subtable
           if !tables.is_empty() {
             table.write(&tables.last().unwrap().columns[0].value.borrow());
             table.write("\t");
           }
+
+          // Now write out the other column values
           for i in 0..table.columns.len() {
+            if table.columns[i].subtable.is_some() { continue; }
             if i > 0 { table.write("\t"); }
             if table.columns[i].value.borrow().is_empty() { table.write("\\N"); }
             else {
