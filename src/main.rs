@@ -2,7 +2,7 @@ extern crate quick_xml;
 extern crate yaml_rust;
 
 use std::io::{Read, Write, stdout};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::env;
 use std::cell::RefCell;
@@ -18,12 +18,18 @@ struct Table<'a> {
   columns: Vec<Column<'a>>
 }
 impl<'a> Table<'a> {
-  fn new(path: &str, file: Option<&str>) -> Table<'a> {
+  fn new(path: &str, file: Option<&str>, filemode: &str) -> Table<'a> {
     Table {
       path: String::from(path),
       file: match file {
         None => RefCell::new(Box::new(stdout())),
-        Some(ref file) => RefCell::new(Box::new(File::create(&Path::new(file)).unwrap()))
+        Some(ref file) => RefCell::new(Box::new(
+          match filemode {
+            "truncate" => File::create(&Path::new(file)).unwrap(),
+            "append" => OpenOptions::new().append(true).create(true).open(&Path::new(file)).unwrap(),
+            mode => panic!("Invalid 'mode' setting in configuration file: {}", mode)
+          }
+        ))
       },
       columns: Vec::new()
     }
@@ -97,8 +103,8 @@ fn gml_to_ewkb(cell: &RefCell<String>, geom: &Geometry) {
   }
 }
 
-fn add_table<'a>(rowpath: &str, outfile: Option<&str>, colspec: &'a [Yaml]) -> Table<'a> {
-  let mut table = Table::new(rowpath, outfile);
+fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, colspec: &'a [Yaml]) -> Table<'a> {
+  let mut table = Table::new(rowpath, outfile, filemode);
   for col in colspec {
     let name = col["name"].as_str().expect("Column has no 'name' entry in configuration file");
     let colpath = col["path"].as_str().expect("Column has no 'path' entry in configuration file");
@@ -108,7 +114,7 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, colspec: &'a [Yaml]) -> T
       true => None,
       false => {
         let file = col["file"].as_str().expect("Subtable has no 'file' entry");
-        Some(add_table(&path, Some(&file), col["cols"].as_vec().expect("Subtable 'cols' entry is not an array")))
+        Some(add_table(&path, Some(&file), filemode, col["cols"].as_vec().expect("Subtable 'cols' entry is not an array")))
       }
     };
     let attr = col["attr"].as_str();
@@ -147,7 +153,11 @@ fn main() -> std::io::Result<()> {
   let rowpath = config["path"].as_str().expect("No valid 'path' entry in configuration file");
   let colspec = config["cols"].as_vec().expect("No valid 'cols' array in configuration file");
   let outfile = config["file"].as_str();
-  let maintable = add_table(rowpath, outfile, colspec);
+  let filemode = match config["mode"].is_badvalue() {
+    true => "truncate",
+    false => config["mode"].as_str().expect("Invalid 'mode' entry in configuration file")
+  };
+  let maintable = add_table(rowpath, outfile, filemode, colspec);
   let mut tables: Vec<&Table> = Vec::new();
   let mut table = &maintable;
 
