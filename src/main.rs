@@ -1,6 +1,3 @@
-extern crate quick_xml;
-extern crate yaml_rust;
-
 use std::io::{Read, Write, stdout};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -11,6 +8,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use yaml_rust::YamlLoader;
 use yaml_rust::yaml::Yaml;
+use regex::Regex;
 
 struct Table<'a> {
   path: String,
@@ -37,6 +35,11 @@ impl<'a> Table<'a> {
   fn write(&self, text: &str) {
     self.file.borrow_mut().write_all(&text.as_bytes()).expect("Write error encountered; exiting...");
   }
+  fn clear_columns(&self) {
+    for col in &self.columns {
+      col.value.borrow_mut().clear();
+    }
+  }
 }
 
 struct Column<'a> {
@@ -44,6 +47,7 @@ struct Column<'a> {
   path: String,
   value: RefCell<String>,
   attr: Option<&'a str>,
+  filter: Option<Regex>,
   convert: Option<&'a str>,
   find: Option<&'a str>,
   replace: Option<&'a str>,
@@ -117,12 +121,32 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, colspec: 
         Some(add_table(&path, Some(&file), filemode, col["cols"].as_vec().expect("Subtable 'cols' entry is not an array")))
       }
     };
+    let filter: Option<Regex> = match col["filt"].as_str() {
+      Some(str) => Some(Regex::new(&str).expect("Invalid regex in 'filt' entry in configuration file")),
+      None => None
+    };
     let attr = col["attr"].as_str();
     let convert = col["conv"].as_str();
     let find = col["find"].as_str();
     let replace = col["repl"].as_str();
     let consol = col["cons"].as_str();
-    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, convert, find, replace, consol, subtable };
+
+    if convert.is_some() && !vec!("xml-to-text", "gml-to-ewkb").contains(&convert.unwrap()) {
+      panic!("Option 'convert' contains invalid value {}", convert.unwrap());
+    }
+    if filter.is_some() {
+      if convert.is_some() {
+        panic!("Option 'filt' and 'conv' cannot be used together on a single column");
+      }
+      if find.is_some() {
+        eprintln!("Notice: when using a filter and find/replace on a single column, the filter is applied before replacements");
+      }
+      if consol.is_some() {
+        eprintln!("Notice: when using a filter and consolidation on a single column, the filter is applied to each phase of consolidation separately");
+      }
+    }
+
+    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, filter, convert, find, replace, consol, subtable };
     table.columns.push(column);
   }
   table
@@ -148,7 +172,8 @@ fn main() -> std::io::Result<()> {
 
   let mut path = String::new();
   let mut buf = Vec::new();
-  let mut count = 0;
+  let mut fullcount = 0;
+  let mut filtercount = 0;
 
   let rowpath = config["path"].as_str().expect("No valid 'path' entry in configuration file");
   let colspec = config["cols"].as_vec().expect("No valid 'cols' array in configuration file");
@@ -161,10 +186,12 @@ fn main() -> std::io::Result<()> {
   let mut tables: Vec<&Table> = Vec::new();
   let mut table = &maintable;
 
+  let mut filtered = false;
   let mut xmltotext = false;
   let mut text = String::new();
   let mut gmltoewkb = false;
   let mut gmlpos = false;
+  let mut gmlint = false;
   let mut gmlgeom = Geometry::new();
   let start = Instant::now();
   loop {
@@ -172,6 +199,7 @@ fn main() -> std::io::Result<()> {
       Ok(Event::Start(ref e)) => {
         path.push('/');
         path.push_str(reader.decode(e.name()).unwrap());
+        if filtered { continue; }
         if xmltotext {
           text.push_str(&format!("<{}>", &e.unescape_and_decode(&reader).unwrap()));
           continue;
@@ -211,8 +239,13 @@ fn main() -> std::io::Result<()> {
               "gml:Point" => gmlgeom.gtype = 1,
               "gml:LineString" => gmlgeom.gtype = 2,
               "gml:Polygon" => gmlgeom.gtype = 3,
+              "gml:MultiPolygon" => (),
+              "gml:polygonMember" => (),
               "gml:exterior" => (),
-              "gml:interior" => (),
+              "gml:interior" => {
+                eprintln!("GML polygon interior ring not yet supported; ignored");
+                gmlint = true;
+              },
               "gml:LinearRing" => gmlgeom.rings.push(Vec::new()),
               "gml:posList" => gmlpos = true,
               _ => eprintln!("GML type {} not supported", tag)
@@ -221,7 +254,7 @@ fn main() -> std::io::Result<()> {
           continue;
         }
         else if path == table.path {
-          count += 1;
+          fullcount += 1;
         }
         else if path.len() > table.path.len() {
           for i in 0..table.columns.len() {
@@ -254,6 +287,12 @@ fn main() -> std::io::Result<()> {
                 if table.columns[i].value.borrow().is_empty() {
                   eprintln!("Column {} requested attribute {} not found", table.columns[i].name, request);
                 }
+                if let Some(re) = &table.columns[i].filter {
+                  if !re.is_match(&table.columns[i].value.borrow()) {
+                    filtered = true;
+                    table.clear_columns();
+                  }
+                }
               }
 
               // Set the appropriate convert flag for the following data in case the 'conv' option is present
@@ -269,12 +308,13 @@ fn main() -> std::io::Result<()> {
         }
       },
       Ok(Event::Text(ref e)) => {
+        if filtered { continue; }
         if xmltotext {
           text.push_str(&e.unescape_and_decode(&reader).unwrap());
           continue;
         }
         else if gmltoewkb {
-          if gmlpos {
+          if gmlpos && !gmlint {
             let value = String::from(&e.unescape_and_decode(&reader).unwrap());
             for pos in value.split(' ') {
               gmlgeom.rings.last_mut().unwrap().push(pos.parse().unwrap());
@@ -301,35 +341,47 @@ fn main() -> std::io::Result<()> {
               }
             }
             table.columns[i].value.borrow_mut().push_str(&e.unescape_and_decode(&reader).unwrap().replace("\\", "\\\\"));
+            if let Some(re) = &table.columns[i].filter {
+              if !re.is_match(&table.columns[i].value.borrow()) {
+                filtered = true;
+                table.clear_columns();
+              }
+            }
             break;
           }
         }
       },
       Ok(Event::End(_)) => {
         if path == table.path {
-
-          // End tag of a subtable; write the first column value of the parent table as the first column of the subtable
-          if !tables.is_empty() {
-            table.write(&tables.last().unwrap().columns[0].value.borrow());
-            table.write("\t");
+          if filtered {
+            filtered = false;
+            filtercount += 1;
           }
+          else {
 
-          // Now write out the other column values
-          for i in 0..table.columns.len() {
-            if table.columns[i].subtable.is_some() { continue; }
-            if i > 0 { table.write("\t"); }
-            if table.columns[i].value.borrow().is_empty() { table.write("\\N"); }
-            else {
-              if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
-                let mut value = table.columns[i].value.borrow_mut();
-                *value = value.replace(s, r);
-              }
-              table.write(&table.columns[i].value.borrow());
-              table.columns[i].value.borrow_mut().clear();
+            // End tag of a subtable; write the first column value of the parent table as the first column of the subtable
+            if !tables.is_empty() {
+              table.write(&tables.last().unwrap().columns[0].value.borrow());
+              table.write("\t");
             }
+
+            // Now write out the other column values
+            for i in 0..table.columns.len() {
+              if table.columns[i].subtable.is_some() { continue; }
+              if i > 0 { table.write("\t"); }
+              if table.columns[i].value.borrow().is_empty() { table.write("\\N"); }
+              else {
+                if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
+                  let mut value = table.columns[i].value.borrow_mut();
+                  *value = value.replace(s, r);
+                }
+                table.write(&table.columns[i].value.borrow());
+                table.columns[i].value.borrow_mut().clear();
+              }
+            }
+            table.write("\n");
+            if !tables.is_empty() { table = tables.pop().unwrap(); }
           }
-          table.write("\n");
-          if !tables.is_empty() { table = tables.pop().unwrap(); }
         }
         let i = path.rfind('/').unwrap();
         let tag = path.split_off(i);
@@ -348,6 +400,8 @@ fn main() -> std::io::Result<()> {
           }
         }
         else if gmltoewkb {
+          if gmlpos && (tag == "gml:posList") { gmlpos = false; }
+          if gmlint && (tag == "gml:interior") { gmlint = false; }
           for i in 0..table.columns.len() {
             if path == table.columns[i].path {
               gmltoewkb = false;
@@ -364,6 +418,6 @@ fn main() -> std::io::Result<()> {
     }
     buf.clear();
   }
-  eprintln!("{} rows processed in {} seconds", count, start.elapsed().as_secs());
+  eprintln!("{} rows processed in {} seconds{}", fullcount-filtercount, start.elapsed().as_secs(), match filtercount { 0 => "".to_owned(), n => format!(" ({} filtered)", n) });
   Ok(())
 }
