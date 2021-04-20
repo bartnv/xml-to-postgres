@@ -400,8 +400,8 @@ fn main() -> std::io::Result<()> {
           }
         }
         else if gmltoewkb {
-          if gmlpos && (tag == "gml:posList") { gmlpos = false; }
-          if gmlint && (tag == "gml:interior") { gmlint = false; }
+          if gmlpos && (tag == "/gml:posList") { gmlpos = false; }
+          if gmlint && (tag == "/gml:interior") { gmlint = false; }
           for i in 0..table.columns.len() {
             if path == table.columns[i].path {
               gmltoewkb = false;
