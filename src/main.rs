@@ -71,36 +71,39 @@ struct Geometry {
   rings: Vec<Vec<f64>>
 }
 impl Geometry {
-  fn new() -> Geometry {
-    Geometry { gtype: 0, dims: 2, srid: 4326, rings: Vec::new() }
-  }
-  fn reset(&mut self) {
-    self.gtype = 0;
-    self.dims = 2;
-    self.srid = 4326;
-    self.rings.clear();
+  fn new(gtype: u8) -> Geometry {
+    Geometry { gtype, dims: 2, srid: 4326, rings: Vec::new() }
   }
 }
 
-fn gml_to_ewkb(cell: &RefCell<String>, geom: &Geometry) {
-  let mut ewkb = vec![1, geom.gtype, 0, 0];
-  let code = match geom.dims {
-    2 => 32,
-    3 => 32 | 128,
-    _ => {
-      eprintln!("GML number of dimensions {} not supported", geom.dims);
-      32
-    }
-  };
-  ewkb.push(code);
-  ewkb.extend_from_slice(&geom.srid.to_le_bytes());
-  ewkb.extend_from_slice(&(geom.rings.len() as u32).to_le_bytes());
-  for ring in geom.rings.iter() {
-    ewkb.extend_from_slice(&((ring.len() as u32)/geom.dims as u32).to_le_bytes());
-    for pos in ring.iter() {
-      ewkb.extend_from_slice(&pos.to_le_bytes());
+fn gml_to_ewkb(cell: &RefCell<String>, coll: &Vec<Geometry>) {
+  let mut ewkb: Vec<u8> = vec![];
+
+//  if coll.len() > 1 {
+    ewkb.extend_from_slice(&[1, 6, 0, 0, 0]);
+    ewkb.extend_from_slice(&(coll.len() as u32).to_le_bytes());
+//  }
+
+  for geom in coll {
+    let code = match geom.dims {
+      2 => 32, // Indicate EWKB where the srid follows this byte
+      3 => 32 | 128, // Add bit to indicate the presense of Z values
+      _ => {
+        eprintln!("GML number of dimensions {} not supported", geom.dims);
+        32
+      }
+    };
+    ewkb.extend_from_slice(&[1, geom.gtype, 0, 0, code]);
+    ewkb.extend_from_slice(&geom.srid.to_le_bytes());
+    ewkb.extend_from_slice(&(geom.rings.len() as u32).to_le_bytes());
+    for ring in geom.rings.iter() {
+      ewkb.extend_from_slice(&((ring.len() as u32)/geom.dims as u32).to_le_bytes());
+      for pos in ring.iter() {
+        ewkb.extend_from_slice(&pos.to_le_bytes());
+      }
     }
   }
+
   let mut value = cell.borrow_mut();
   for byte in ewkb.iter() {
     value.push_str(&format!("{:02X}", byte));
@@ -191,8 +194,7 @@ fn main() -> std::io::Result<()> {
   let mut text = String::new();
   let mut gmltoewkb = false;
   let mut gmlpos = false;
-  let mut gmlint = false;
-  let mut gmlgeom = Geometry::new();
+  let mut gmlcoll: Vec<Geometry> = vec![];
   let start = Instant::now();
   loop {
     match reader.read_event(&mut buf) {
@@ -217,14 +219,18 @@ fn main() -> std::io::Result<()> {
                       value = value.split_off(i+2);
                     }
                     match value.parse::<u32>() {
-                      Ok(int) => gmlgeom.srid = int,
+                      Ok(int) => {
+                        if let Some(geom) = gmlcoll.last_mut() { geom.srid = int };
+                      },
                       Err(_) => eprintln!("Invalid srsName {} in GML", value)
                     }
                   },
                   Ok("srsDimension") => {
                     let value = reader.decode(&attr.value).unwrap();
                     match value.parse::<u8>() {
-                      Ok(int) => gmlgeom.dims = int,
+                      Ok(int) => {
+                        if let Some(geom) = gmlcoll.last_mut() { geom.dims = int };
+                      },
                       Err(_) => eprintln!("Invalid srsDimension {} in GML", value)
                     }
                   }
@@ -236,17 +242,14 @@ fn main() -> std::io::Result<()> {
           match reader.decode(e.name()) {
             Err(_) => (),
             Ok(tag) => match tag {
-              "gml:Point" => gmlgeom.gtype = 1,
-              "gml:LineString" => gmlgeom.gtype = 2,
-              "gml:Polygon" => gmlgeom.gtype = 3,
+              "gml:Point" => gmlcoll.push(Geometry::new(1)),
+              "gml:LineString" => gmlcoll.push(Geometry::new(2)),
+              "gml:Polygon" => gmlcoll.push(Geometry::new(3)),
               "gml:MultiPolygon" => (),
               "gml:polygonMember" => (),
               "gml:exterior" => (),
-              "gml:interior" => {
-                eprintln!("GML polygon interior ring not yet supported; ignored");
-                gmlint = true;
-              },
-              "gml:LinearRing" => gmlgeom.rings.push(Vec::new()),
+              "gml:interior" => (),
+              "gml:LinearRing" => gmlcoll.last_mut().unwrap().rings.push(Vec::new()),
               "gml:posList" => gmlpos = true,
               _ => eprintln!("GML type {} not supported", tag)
             }
@@ -314,10 +317,10 @@ fn main() -> std::io::Result<()> {
           continue;
         }
         else if gmltoewkb {
-          if gmlpos && !gmlint {
+          if gmlpos {
             let value = String::from(&e.unescape_and_decode(&reader).unwrap());
             for pos in value.split(' ') {
-              gmlgeom.rings.last_mut().unwrap().push(pos.parse().unwrap());
+              gmlcoll.last_mut().unwrap().rings.last_mut().unwrap().push(pos.parse().unwrap());
             }
           }
           continue;
@@ -352,15 +355,14 @@ fn main() -> std::io::Result<()> {
         }
       },
       Ok(Event::End(_)) => {
-        if path == table.path {
+        if path == table.path { // This is an end tag of the row path
           if filtered {
             filtered = false;
             filtercount += 1;
           }
           else {
 
-            // End tag of a subtable; write the first column value of the parent table as the first column of the subtable
-            if !tables.is_empty() {
+            if !tables.is_empty() { // This is a subtable; write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
               table.write(&tables.last().unwrap().columns[0].value.borrow());
               table.write("\t");
             }
@@ -401,12 +403,11 @@ fn main() -> std::io::Result<()> {
         }
         else if gmltoewkb {
           if gmlpos && (tag == "/gml:posList") { gmlpos = false; }
-          if gmlint && (tag == "/gml:interior") { gmlint = false; }
           for i in 0..table.columns.len() {
             if path == table.columns[i].path {
               gmltoewkb = false;
-              gml_to_ewkb(&table.columns[i].value, &gmlgeom);
-              gmlgeom.reset();
+              gml_to_ewkb(&table.columns[i].value, &gmlcoll);
+              gmlcoll.clear();
               break;
             }
           }
