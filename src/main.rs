@@ -13,10 +13,11 @@ use regex::Regex;
 struct Table<'a> {
   path: String,
   file: RefCell<Box<dyn Write>>,
+  skip: String,
   columns: Vec<Column<'a>>
 }
 impl<'a> Table<'a> {
-  fn new(path: &str, file: Option<&str>, filemode: &str) -> Table<'a> {
+  fn new(path: &str, file: Option<&str>, filemode: &str, skip: Option<&'a str>) -> Table<'a> {
     Table {
       path: String::from(path),
       file: match file {
@@ -29,7 +30,8 @@ impl<'a> Table<'a> {
           }
         ))
       },
-      columns: Vec::new()
+      columns: Vec::new(),
+      skip: match skip { Some(s) => format!("{}{}", path, s), None => String::new() }
     }
   }
   fn write(&self, text: &str) {
@@ -79,10 +81,11 @@ impl Geometry {
 fn gml_to_ewkb(cell: &RefCell<String>, coll: &Vec<Geometry>) {
   let mut ewkb: Vec<u8> = vec![];
 
-//  if coll.len() > 1 {
-    ewkb.extend_from_slice(&[1, 6, 0, 0, 0]);
+  if coll.len() > 1 {
+    let multitype = coll.first().unwrap().gtype+3;
+    ewkb.extend_from_slice(&[1, multitype, 0, 0, 0]);
     ewkb.extend_from_slice(&(coll.len() as u32).to_le_bytes());
-//  }
+  }
 
   for geom in coll {
     let code = match geom.dims {
@@ -95,9 +98,9 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &Vec<Geometry>) {
     };
     ewkb.extend_from_slice(&[1, geom.gtype, 0, 0, code]);
     ewkb.extend_from_slice(&geom.srid.to_le_bytes());
-    ewkb.extend_from_slice(&(geom.rings.len() as u32).to_le_bytes());
+    if geom.gtype == 3 { ewkb.extend_from_slice(&(geom.rings.len() as u32).to_le_bytes()); } // Only polygons have multiple rings
     for ring in geom.rings.iter() {
-      ewkb.extend_from_slice(&((ring.len() as u32)/geom.dims as u32).to_le_bytes());
+      if geom.gtype != 1 { ewkb.extend_from_slice(&((ring.len() as u32)/geom.dims as u32).to_le_bytes()); } // Points don't have multiple vertices
       for pos in ring.iter() {
         ewkb.extend_from_slice(&pos.to_le_bytes());
       }
@@ -110,8 +113,8 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &Vec<Geometry>) {
   }
 }
 
-fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, colspec: &'a [Yaml]) -> Table<'a> {
-  let mut table = Table::new(rowpath, outfile, filemode);
+fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Option<&'a str>, colspec: &'a [Yaml]) -> Table<'a> {
+  let mut table = Table::new(rowpath, outfile, filemode, skip);
   for col in colspec {
     let name = col["name"].as_str().expect("Column has no 'name' entry in configuration file");
     let colpath = col["path"].as_str().expect("Column has no 'path' entry in configuration file");
@@ -121,7 +124,7 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, colspec: 
       true => None,
       false => {
         let file = col["file"].as_str().expect("Subtable has no 'file' entry");
-        Some(add_table(&path, Some(&file), filemode, col["cols"].as_vec().expect("Subtable 'cols' entry is not an array")))
+        Some(add_table(&path, Some(&file), filemode, skip, col["cols"].as_vec().expect("Subtable 'cols' entry is not an array")))
       }
     };
     let filter: Option<Regex> = match col["filt"].as_str() {
@@ -177,6 +180,7 @@ fn main() -> std::io::Result<()> {
   let mut buf = Vec::new();
   let mut fullcount = 0;
   let mut filtercount = 0;
+  let mut skipcount = 0;
 
   let rowpath = config["path"].as_str().expect("No valid 'path' entry in configuration file");
   let colspec = config["cols"].as_vec().expect("No valid 'cols' array in configuration file");
@@ -185,11 +189,13 @@ fn main() -> std::io::Result<()> {
     true => "truncate",
     false => config["mode"].as_str().expect("Invalid 'mode' entry in configuration file")
   };
-  let maintable = add_table(rowpath, outfile, filemode, colspec);
+  let skip = config["skip"].as_str();
+  let maintable = add_table(rowpath, outfile, filemode, skip, colspec);
   let mut tables: Vec<&Table> = Vec::new();
   let mut table = &maintable;
 
   let mut filtered = false;
+  let mut skipped = false;
   let mut xmltotext = false;
   let mut text = String::new();
   let mut gmltoewkb = false;
@@ -201,12 +207,35 @@ fn main() -> std::io::Result<()> {
       Ok(Event::Start(ref e)) => {
         path.push('/');
         path.push_str(reader.decode(e.name()).unwrap());
-        if filtered { continue; }
-        if xmltotext {
+        if filtered || skipped { continue; }
+        if path == table.skip {
+          skipped = true;
+          continue;
+        }
+        else if xmltotext {
           text.push_str(&format!("<{}>", &e.unescape_and_decode(&reader).unwrap()));
           continue;
         }
         else if gmltoewkb {
+          match reader.decode(e.name()) {
+            Err(_) => (),
+            Ok(tag) => match tag {
+              "gml:Point" => {
+                gmlcoll.push(Geometry::new(1));
+                gmlcoll.last_mut().unwrap().rings.push(Vec::new());
+              },
+              "gml:LineString" => gmlcoll.push(Geometry::new(2)),
+              "gml:Polygon" => gmlcoll.push(Geometry::new(3)),
+              "gml:MultiPolygon" => (),
+              "gml:polygonMember" => (),
+              "gml:exterior" => (),
+              "gml:interior" => (),
+              "gml:LinearRing" => gmlcoll.last_mut().unwrap().rings.push(Vec::new()),
+              "gml:posList" => gmlpos = true,
+              "gml:pos" => gmlpos = true,
+              _ => eprintln!("GML type {} not supported", tag)
+            }
+          }
           for res in e.attributes() {
             match res {
               Err(_) => (),
@@ -237,21 +266,6 @@ fn main() -> std::io::Result<()> {
                   _ => ()
                 }
               }
-            }
-          }
-          match reader.decode(e.name()) {
-            Err(_) => (),
-            Ok(tag) => match tag {
-              "gml:Point" => gmlcoll.push(Geometry::new(1)),
-              "gml:LineString" => gmlcoll.push(Geometry::new(2)),
-              "gml:Polygon" => gmlcoll.push(Geometry::new(3)),
-              "gml:MultiPolygon" => (),
-              "gml:polygonMember" => (),
-              "gml:exterior" => (),
-              "gml:interior" => (),
-              "gml:LinearRing" => gmlcoll.last_mut().unwrap().rings.push(Vec::new()),
-              "gml:posList" => gmlpos = true,
-              _ => eprintln!("GML type {} not supported", tag)
             }
           }
           continue;
@@ -311,7 +325,7 @@ fn main() -> std::io::Result<()> {
         }
       },
       Ok(Event::Text(ref e)) => {
-        if filtered { continue; }
+        if filtered || skipped { continue; }
         if xmltotext {
           text.push_str(&e.unescape_and_decode(&reader).unwrap());
           continue;
@@ -334,6 +348,9 @@ fn main() -> std::io::Result<()> {
                   eprintln!("Column '{}' has multiple occurrences without a consolidation method; using 'first'", table.columns[i].name);
                   break;
                 }
+              },
+              Some("first") => {
+                break;
               },
               Some("append") => {
                 if !table.columns[i].value.borrow().is_empty() { table.columns[i].value.borrow_mut().push(','); }
@@ -385,6 +402,10 @@ fn main() -> std::io::Result<()> {
             if !tables.is_empty() { table = tables.pop().unwrap(); }
           }
         }
+        else if path == table.skip {
+          skipped = false;
+          skipcount += 1;
+        }
         let i = path.rfind('/').unwrap();
         let tag = path.split_off(i);
         if xmltotext {
@@ -402,7 +423,7 @@ fn main() -> std::io::Result<()> {
           }
         }
         else if gmltoewkb {
-          if gmlpos && (tag == "/gml:posList") { gmlpos = false; }
+          if gmlpos && ((tag == "/gml:pos") || (tag == "/gml:posList")) { gmlpos = false; }
           for i in 0..table.columns.len() {
             if path == table.columns[i].path {
               gmltoewkb = false;
@@ -419,6 +440,11 @@ fn main() -> std::io::Result<()> {
     }
     buf.clear();
   }
-  eprintln!("{} rows processed in {} seconds{}", fullcount-filtercount, start.elapsed().as_secs(), match filtercount { 0 => "".to_owned(), n => format!(" ({} filtered)", n) });
+  eprintln!("{} rows processed in {} seconds{}{}",
+    fullcount-filtercount-skipcount,
+    start.elapsed().as_secs(),
+    match filtercount { 0 => "".to_owned(), n => format!(" ({} filtered)", n) },
+    match skipcount { 0 => "".to_owned(), n => format!(" ({} skipped)", n) }
+  );
   Ok(())
 }
