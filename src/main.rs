@@ -35,7 +35,7 @@ impl<'a> Table<'a> {
     }
   }
   fn write(&self, text: &str) {
-    self.file.borrow_mut().write_all(&text.as_bytes()).expect("Write error encountered; exiting...");
+    self.file.borrow_mut().write_all(text.as_bytes()).expect("Write error encountered; exiting...");
   }
   fn clear_columns(&self) {
     for col in &self.columns {
@@ -78,7 +78,7 @@ impl Geometry {
   }
 }
 
-fn gml_to_ewkb(cell: &RefCell<String>, coll: &Vec<Geometry>) {
+fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry]) {
   let mut ewkb: Vec<u8> = vec![];
 
   if coll.len() > 1 {
@@ -124,13 +124,10 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
       true => None,
       false => {
         let file = col["file"].as_str().expect("Subtable has no 'file' entry");
-        Some(add_table(&path, Some(&file), filemode, skip, col["cols"].as_vec().expect("Subtable 'cols' entry is not an array")))
+        Some(add_table(&path, Some(file), filemode, skip, col["cols"].as_vec().expect("Subtable 'cols' entry is not an array")))
       }
     };
-    let filter: Option<Regex> = match col["filt"].as_str() {
-      Some(str) => Some(Regex::new(&str).expect("Invalid regex in 'filt' entry in configuration file")),
-      None => None
-    };
+    let filter: Option<Regex> = col["filt"].as_str().map(|str| Regex::new(str).expect("Invalid regex in 'filt' entry in configuration file"));
     let attr = col["attr"].as_str();
     let convert = col["conv"].as_str();
     let find = col["find"].as_str();
@@ -287,7 +284,7 @@ fn main() -> std::io::Result<()> {
               // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
               if table.columns[i].subtable.is_some() {
                 tables.push(table);
-                table = &table.columns[i].subtable.as_ref().unwrap();
+                table = table.columns[i].subtable.as_ref().unwrap();
                 break;
               }
 
