@@ -1,4 +1,4 @@
-use std::io::{Read, Write, stdout};
+use std::io::{Read, Write, BufReader, BufRead, stdin, stdout};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::env;
@@ -160,7 +160,14 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
 
 fn main() -> std::io::Result<()> {
   let args: Vec<_> = env::args().collect();
-  if args.len() != 3 {
+  let bufread: Box<dyn BufRead>;
+  if args.len() == 2 {
+    bufread = Box::new(BufReader::new(stdin()));
+  }
+  else if args.len() == 3 {
+    bufread = Box::new(BufReader::new(File::open(&args[2])?));
+  }
+  else {
     eprintln!("usage: {} <configfile> <xmlfile>", args[0]);
     return Ok(());
   }
@@ -172,7 +179,7 @@ fn main() -> std::io::Result<()> {
   };
 
   let mut reader;
-  reader = Reader::from_file(&args[2]).unwrap();
+  reader = Reader::from_reader(bufread);
   reader.trim_text(true)
         .expand_empty_elements(true);
 
