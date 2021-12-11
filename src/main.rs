@@ -50,7 +50,8 @@ struct Column<'a> {
   value: RefCell<String>,
   attr: Option<&'a str>,
   hide: bool,
-  filter: Option<Regex>,
+  include: Option<Regex>,
+  exclude: Option<Regex>,
   convert: Option<&'a str>,
   find: Option<&'a str>,
   replace: Option<&'a str>,
@@ -129,7 +130,8 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
       }
     };
     let hide = col["hide"].as_bool().unwrap_or(false);
-    let filter: Option<Regex> = col["filt"].as_str().map(|str| Regex::new(str).expect("Invalid regex in 'filt' entry in configuration file"));
+    let include: Option<Regex> = col["incl"].as_str().map(|str| Regex::new(str).expect("Invalid regex in 'incl' entry in configuration file"));
+    let exclude: Option<Regex> = col["excl"].as_str().map(|str| Regex::new(str).expect("Invalid regex in 'excl' entry in configuration file"));
     let attr = col["attr"].as_str();
     let convert = col["conv"].as_str();
     let find = col["find"].as_str();
@@ -139,19 +141,19 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
     if convert.is_some() && !vec!("xml-to-text", "gml-to-ewkb").contains(&convert.unwrap()) {
       panic!("Option 'convert' contains invalid value {}", convert.unwrap());
     }
-    if filter.is_some() {
+    if include.is_some() || exclude.is_some() {
       if convert.is_some() {
-        panic!("Option 'filt' and 'conv' cannot be used together on a single column");
+        panic!("Filtering (incl/excl) and 'conv' cannot be used together on a single column");
       }
       if find.is_some() {
-        eprintln!("Notice: when using a filter and find/replace on a single column, the filter is applied before replacements");
+        eprintln!("Notice: when using filtering (incl/excl) and find/replace on a single column, the filter is checked before replacements");
       }
       if consol.is_some() {
-        eprintln!("Notice: when using a filter and consolidation on a single column, the filter is applied to each phase of consolidation separately");
+        eprintln!("Notice: when using filtering (incl/excl) and consolidation on a single column, the filter is checked at each phase of consolidation separately");
       }
     }
 
-    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, hide, filter, convert, find, replace, consol, subtable };
+    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, hide, include, exclude, convert, find, replace, consol, subtable };
     table.columns.push(column);
   }
   table
@@ -310,8 +312,14 @@ fn main() -> std::io::Result<()> {
                 if table.columns[i].value.borrow().is_empty() {
                   eprintln!("Column {} requested attribute {} not found", table.columns[i].name, request);
                 }
-                if let Some(re) = &table.columns[i].filter {
+                if let Some(re) = &table.columns[i].include {
                   if !re.is_match(&table.columns[i].value.borrow()) {
+                    filtered = true;
+                    table.clear_columns();
+                  }
+                }
+                if let Some(re) = &table.columns[i].exclude {
+                  if re.is_match(&table.columns[i].value.borrow()) {
                     filtered = true;
                     table.clear_columns();
                   }
@@ -367,8 +375,14 @@ fn main() -> std::io::Result<()> {
               }
             }
             table.columns[i].value.borrow_mut().push_str(&e.unescape_and_decode(&reader).unwrap().replace("\\", "\\\\"));
-            if let Some(re) = &table.columns[i].filter {
+            if let Some(re) = &table.columns[i].include {
               if !re.is_match(&table.columns[i].value.borrow()) {
+                filtered = true;
+                table.clear_columns();
+              }
+            }
+            if let Some(re) = &table.columns[i].exclude {
+              if re.is_match(&table.columns[i].value.borrow()) {
                 filtered = true;
                 table.clear_columns();
               }
@@ -449,7 +463,7 @@ fn main() -> std::io::Result<()> {
   eprintln!("{} rows processed in {} seconds{}{}",
     fullcount-filtercount-skipcount,
     start.elapsed().as_secs(),
-    match filtercount { 0 => "".to_owned(), n => format!(" ({} filtered)", n) },
+    match filtercount { 0 => "".to_owned(), n => format!(" ({} excluded)", n) },
     match skipcount { 0 => "".to_owned(), n => format!(" ({} skipped)", n) }
   );
   Ok(())
