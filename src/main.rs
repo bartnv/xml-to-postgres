@@ -49,6 +49,7 @@ struct Column<'a> {
   path: String,
   value: RefCell<String>,
   attr: Option<&'a str>,
+  hide: bool,
   filter: Option<Regex>,
   convert: Option<&'a str>,
   find: Option<&'a str>,
@@ -127,6 +128,7 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
         Some(add_table(&path, Some(file), filemode, skip, col["cols"].as_vec().expect("Subtable 'cols' entry is not an array")))
       }
     };
+    let hide = col["hide"].as_bool().unwrap_or(false);
     let filter: Option<Regex> = col["filt"].as_str().map(|str| Regex::new(str).expect("Invalid regex in 'filt' entry in configuration file"));
     let attr = col["attr"].as_str();
     let convert = col["conv"].as_str();
@@ -149,7 +151,7 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
       }
     }
 
-    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, filter, convert, find, replace, consol, subtable };
+    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, hide, filter, convert, find, replace, consol, subtable };
     table.columns.push(column);
   }
   table
@@ -390,7 +392,7 @@ fn main() -> std::io::Result<()> {
 
             // Now write out the other column values
             for i in 0..table.columns.len() {
-              if table.columns[i].subtable.is_some() { continue; }
+              if table.columns[i].hide || table.columns[i].subtable.is_some() { continue; }
               if i > 0 { table.write("\t"); }
               if table.columns[i].value.borrow().is_empty() { table.write("\\N"); }
               else {
