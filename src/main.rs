@@ -9,6 +9,7 @@ use quick_xml::events::Event;
 use yaml_rust::YamlLoader;
 use yaml_rust::yaml::Yaml;
 use regex::Regex;
+use lazy_static::lazy_static;
 
 struct Table<'a> {
   path: String,
@@ -56,7 +57,8 @@ struct Column<'a> {
   find: Option<&'a str>,
   replace: Option<&'a str>,
   consol: Option<&'a str>,
-  subtable: Option<Table<'a>>
+  subtable: Option<Table<'a>>,
+  bbox: Option<BBox>
 }
 impl std::fmt::Debug for Column<'_> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -80,7 +82,24 @@ impl Geometry {
   }
 }
 
-fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry]) {
+struct BBox {
+  minx: f64,
+  miny: f64,
+  maxx: f64,
+  maxy: f64
+}
+impl BBox {
+  fn from(str: &str) -> Option<BBox> {
+    lazy_static! {
+      static ref RE: Regex = Regex::new(r"^([0-9.]+),([0-9.]+) ([0-9.]+),([0-9.]+)$").unwrap();
+    }
+    RE.captures(str).map(|caps|
+      BBox { minx: caps[1].parse().unwrap(), miny: caps[2].parse().unwrap(), maxx: caps[3].parse().unwrap(), maxy: caps[4].parse().unwrap() }
+    )
+  }
+}
+
+fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>) -> bool {
   let mut ewkb: Vec<u8> = vec![];
 
   if coll.len() > 1 {
@@ -100,11 +119,39 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry]) {
     };
     ewkb.extend_from_slice(&[1, geom.gtype, 0, 0, code]);
     ewkb.extend_from_slice(&geom.srid.to_le_bytes());
-    if geom.gtype == 3 { ewkb.extend_from_slice(&(geom.rings.len() as u32).to_le_bytes()); } // Only polygons have multiple rings
-    for ring in geom.rings.iter() {
-      if geom.gtype != 1 { ewkb.extend_from_slice(&((ring.len() as u32)/geom.dims as u32).to_le_bytes()); } // Points don't have multiple vertices
-      for pos in ring.iter() {
-        ewkb.extend_from_slice(&pos.to_le_bytes());
+    if geom.gtype == 3 { ewkb.extend_from_slice(&(geom.rings.len() as u32).to_le_bytes()); } // Only polygons can have multiple rings
+    if let Some(bbox) = bbox {
+      let mut overlap = false;
+      let mut overlapx = false;
+      for ring in geom.rings.iter() {
+        if geom.gtype != 1 { ewkb.extend_from_slice(&((ring.len() as u32)/geom.dims as u32).to_le_bytes()); } // Points don't have multiple vertices
+        for (i, pos) in ring.iter().enumerate() {
+          if overlap == true { }
+          else if geom.dims == 2 {
+            if i%2 == 0 {
+              overlapx = false;
+              if *pos >= bbox.minx && *pos <= bbox.maxx { overlapx = true; }
+            }
+            else if overlapx && *pos < bbox.miny && *pos > bbox.maxy { overlap = true; }
+          }
+          else { // geom.dims == 3
+            if i%3 == 0 {
+              overlapx = false;
+              if *pos >= bbox.minx && *pos <= bbox.maxx { overlapx = true; }
+            }
+            else if overlapx && i%3 == 1 && (*pos >= bbox.miny && *pos <= bbox.maxy) { overlap = true; }
+          }
+          ewkb.extend_from_slice(&pos.to_le_bytes());
+        }
+      }
+      if overlap == false { return false; }
+    }
+    else {
+      for ring in geom.rings.iter() {
+        if geom.gtype != 1 { ewkb.extend_from_slice(&((ring.len() as u32)/geom.dims as u32).to_le_bytes()); } // Points don't have multiple vertices
+        for pos in ring.iter() {
+          ewkb.extend_from_slice(&pos.to_le_bytes());
+        }
       }
     }
   }
@@ -113,6 +160,7 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry]) {
   for byte in ewkb.iter() {
     value.push_str(&format!("{:02X}", byte));
   }
+  true
 }
 
 fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Option<&'a str>, colspec: &'a [Yaml]) -> Table<'a> {
@@ -137,6 +185,7 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
     let find = col["find"].as_str();
     let replace = col["repl"].as_str();
     let consol = col["cons"].as_str();
+    let bbox = col["bbox"].as_str().and_then(|str| BBox::from(str));
 
     if convert.is_some() && !vec!("xml-to-text", "gml-to-ewkb").contains(&convert.unwrap()) {
       panic!("Option 'convert' contains invalid value {}", convert.unwrap());
@@ -152,8 +201,11 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
         eprintln!("Notice: when using filtering (incl/excl) and consolidation on a single column, the filter is checked at each phase of consolidation separately");
       }
     }
+    if bbox.is_some() && (convert.is_none() || convert.unwrap() != "gml-to-ewkb") {
+      eprintln!("Warning: the bbox option has no function without conversion type 'gml-to-ekwb'");
+    }
 
-    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, hide, include, exclude, convert, find, replace, consol, subtable };
+    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, hide, include, exclude, convert, find, replace, consol, subtable, bbox };
     table.columns.push(column);
   }
   table
@@ -447,7 +499,10 @@ fn main() -> std::io::Result<()> {
           for i in 0..table.columns.len() {
             if path == table.columns[i].path {
               gmltoewkb = false;
-              gml_to_ewkb(&table.columns[i].value, &gmlcoll);
+              if !gml_to_ewkb(&table.columns[i].value, &gmlcoll, table.columns[i].bbox.as_ref()) {
+                filtered = true;
+                table.clear_columns();
+              }
               gmlcoll.clear();
               break;
             }
