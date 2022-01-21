@@ -71,6 +71,7 @@ impl std::fmt::Debug for Column<'_> {
   }
 }
 
+#[derive(Debug)]
 struct Geometry {
   gtype: u8,
   dims: u8,
@@ -110,6 +111,7 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, m
   }
 
   for geom in coll {
+    // println!("{:?}", geom);
     let code = match geom.dims {
       2 => 32, // Indicate EWKB where the srid follows this byte
       3 => 32 | 128, // Add bit to indicate the presense of Z values
@@ -223,14 +225,14 @@ fn main() -> std::io::Result<()> {
     bufread = Box::new(BufReader::new(File::open(&args[2])?));
   }
   else {
-    eprintln!("usage: {} <configfile> <xmlfile>", args[0]);
+    eprintln!("usage: {} <configfile> [xmlfile]", args[0]);
     return Ok(());
   }
 
   let config = {
     let mut config_str = String::new();
     File::open(&args[1]).unwrap().read_to_string(&mut config_str).unwrap();
-    &YamlLoader::load_from_str(&config_str).unwrap()[0]
+    &YamlLoader::load_from_str(&config_str).unwrap_or_else(|err| { eprintln!("Syntax error in configuration file: {}", err); std::process::exit(0); })[0]
   };
 
   let mut reader;
