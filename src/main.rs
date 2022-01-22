@@ -11,6 +11,17 @@ use yaml_rust::yaml::Yaml;
 use regex::Regex;
 use lazy_static::lazy_static;
 
+macro_rules! fatalerr {
+    () => ({
+      eprintln!();
+      std::process::exit(1);
+    });
+    ($($arg:tt)*) => ({
+        eprintln!($($arg)*);
+        std::process::exit(1);
+    });
+}
+
 struct Table<'a> {
   path: String,
   file: RefCell<Box<dyn Write>>,
@@ -25,9 +36,9 @@ impl<'a> Table<'a> {
         None => RefCell::new(Box::new(stdout())),
         Some(ref file) => RefCell::new(Box::new(
           match filemode {
-            "truncate" => File::create(&Path::new(file)).unwrap(),
-            "append" => OpenOptions::new().append(true).create(true).open(&Path::new(file)).unwrap(),
-            mode => panic!("Invalid 'mode' setting in configuration file: {}", mode)
+            "truncate" => File::create(&Path::new(file)).unwrap_or_else(|err| fatalerr!("Error: failed to create output file '{}': {}", file, err)),
+            "append" => OpenOptions::new().append(true).create(true).open(&Path::new(file)).unwrap_or_else(|err| fatalerr!("Error: failed to open output file '{}': {}", file, err)),
+            mode => fatalerr!("Error: invalid 'mode' setting in configuration file: {}", mode)
           }
         ))
       },
@@ -36,7 +47,7 @@ impl<'a> Table<'a> {
     }
   }
   fn write(&self, text: &str) {
-    self.file.borrow_mut().write_all(text.as_bytes()).expect("Write error encountered; exiting...");
+    self.file.borrow_mut().write_all(text.as_bytes()).unwrap_or_else(|err| fatalerr!("Error: IO error encountered while writing table: {}", err));
   }
   fn clear_columns(&self) {
     for col in &self.columns {
@@ -114,7 +125,7 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, m
     // println!("{:?}", geom);
     let code = match geom.dims {
       2 => 32, // Indicate EWKB where the srid follows this byte
-      3 => 32 | 128, // Add bit to indicate the presense of Z values
+      3 => 32 | 128, // Add bit to indicate the presence of Z values
       _ => {
         eprintln!("GML number of dimensions {} not supported", geom.dims);
         32
@@ -169,20 +180,20 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, m
 fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Option<&'a str>, colspec: &'a [Yaml]) -> Table<'a> {
   let mut table = Table::new(rowpath, outfile, filemode, skip);
   for col in colspec {
-    let name = col["name"].as_str().expect("Column has no 'name' entry in configuration file");
-    let colpath = col["path"].as_str().expect("Column has no 'path' entry in configuration file");
+    let name = col["name"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'name' entry in configuration file"));
+    let colpath = col["path"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'path' entry in configuration file"));
     let mut path = String::from(rowpath);
     path.push_str(colpath);
     let subtable: Option<Table> = match col["cols"].is_badvalue() {
       true => None,
       false => {
-        let file = col["file"].as_str().expect("Subtable has no 'file' entry");
-        Some(add_table(&path, Some(file), filemode, skip, col["cols"].as_vec().expect("Subtable 'cols' entry is not an array")))
+        let file = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable has no 'file' entry"));
+        Some(add_table(&path, Some(file), filemode, skip, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array"))))
       }
     };
     let hide = col["hide"].as_bool().unwrap_or(false);
-    let include: Option<Regex> = col["incl"].as_str().map(|str| Regex::new(str).expect("Invalid regex in 'incl' entry in configuration file"));
-    let exclude: Option<Regex> = col["excl"].as_str().map(|str| Regex::new(str).expect("Invalid regex in 'excl' entry in configuration file"));
+    let include: Option<Regex> = col["incl"].as_str().map(|str| Regex::new(str).unwrap_or_else(|err| fatalerr!("Error: invalid regex in 'incl' entry in configuration file: {}", err)));
+    let exclude: Option<Regex> = col["excl"].as_str().map(|str| Regex::new(str).unwrap_or_else(|err| fatalerr!("Error: invalid regex in 'excl' entry in configuration file: {}", err)));
     let attr = col["attr"].as_str();
     let convert = col["conv"].as_str();
     let find = col["find"].as_str();
@@ -191,12 +202,17 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
     let bbox = col["bbox"].as_str().and_then(BBox::from);
     let multitype = col["mult"].as_bool().unwrap_or(false);
 
-    if convert.is_some() && !vec!("xml-to-text", "gml-to-ewkb").contains(&convert.unwrap()) {
-      panic!("Option 'convert' contains invalid value {}", convert.unwrap());
+    if let Some(val) = convert {
+      if !vec!("xml-to-text", "gml-to-ewkb").contains(&val) {
+        fatalerr!("Error: option 'convert' contains invalid value: {}", val);
+      }
+      if val == "gml-to-ewkb" {
+        eprintln!("Warning: gml-to-ewkb conversion is experimental and in no way complete or standards compliant; use at your own risk");
+      }
     }
     if include.is_some() || exclude.is_some() {
       if convert.is_some() {
-        panic!("Filtering (incl/excl) and 'conv' cannot be used together on a single column");
+        fatalerr!("Error: filtering (incl/excl) and 'conv' cannot be used together on a single column");
       }
       if find.is_some() {
         eprintln!("Notice: when using filtering (incl/excl) and find/replace on a single column, the filter is checked before replacements");
@@ -215,24 +231,22 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
   table
 }
 
-fn main() -> std::io::Result<()> {
+fn main() {
   let args: Vec<_> = env::args().collect();
   let bufread: Box<dyn BufRead>;
   if args.len() == 2 {
     bufread = Box::new(BufReader::new(stdin()));
   }
   else if args.len() == 3 {
-    bufread = Box::new(BufReader::new(File::open(&args[2])?));
+    bufread = Box::new(BufReader::new(File::open(&args[2]).unwrap_or_else(|err| fatalerr!("Error: failed to open input file '{}': {}", args[2], err))));
   }
-  else {
-    eprintln!("usage: {} <configfile> [xmlfile]", args[0]);
-    return Ok(());
-  }
+  else { fatalerr!("Usage: {} <configfile> [xmlfile]", args[0]); }
 
   let config = {
     let mut config_str = String::new();
-    File::open(&args[1]).unwrap().read_to_string(&mut config_str).unwrap();
-    &YamlLoader::load_from_str(&config_str).unwrap_or_else(|err| { eprintln!("Syntax error in configuration file: {}", err); std::process::exit(0); })[0]
+    let mut file = File::open(&args[1]).unwrap_or_else(|err| fatalerr!("Error: failed to open configuration file '{}': {}", args[1], err));
+    file.read_to_string(&mut config_str).unwrap_or_else(|err| fatalerr!("Error: failed to read configuration file '{}': {}", args[1], err));
+    &YamlLoader::load_from_str(&config_str).unwrap_or_else(|err| fatalerr!("Error: invalid syntax in configuration file: {}", err))[0]
   };
 
   let mut reader;
@@ -246,12 +260,12 @@ fn main() -> std::io::Result<()> {
   let mut filtercount = 0;
   let mut skipcount = 0;
 
-  let rowpath = config["path"].as_str().expect("No valid 'path' entry in configuration file");
-  let colspec = config["cols"].as_vec().expect("No valid 'cols' array in configuration file");
+  let rowpath = config["path"].as_str().unwrap_or_else(|| fatalerr!("Error: no valid 'path' entry in configuration file"));
+  let colspec = config["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: no valid 'cols' array in configuration file"));
   let outfile = config["file"].as_str();
   let filemode = match config["mode"].is_badvalue() {
     true => "truncate",
-    false => config["mode"].as_str().expect("Invalid 'mode' entry in configuration file")
+    false => config["mode"].as_str().unwrap_or_else(|| fatalerr!("Error: invalid 'mode' entry in configuration file"))
   };
   let skip = config["skip"].as_str();
   let maintable = add_table(rowpath, outfile, filemode, skip, colspec);
@@ -270,14 +284,14 @@ fn main() -> std::io::Result<()> {
     match reader.read_event(&mut buf) {
       Ok(Event::Start(ref e)) => {
         path.push('/');
-        path.push_str(reader.decode(e.name()).unwrap());
+        path.push_str(reader.decode(e.name()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name()), err)));
         if filtered || skipped { continue; }
         if path == table.skip {
           skipped = true;
           continue;
         }
         else if xmltotext {
-          text.push_str(&format!("<{}>", &e.unescape_and_decode(&reader).unwrap()));
+          text.push_str(&format!("<{}>", &e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name()), err))));
           continue;
         }
         else if gmltoewkb {
@@ -307,7 +321,7 @@ fn main() -> std::io::Result<()> {
                 let key = reader.decode(attr.key);
                 match key {
                   Ok("srsName") => {
-                    let mut value = String::from(reader.decode(&attr.value).unwrap());
+                    let mut value = String::from(reader.decode(&attr.value).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute '{}': {}", String::from_utf8_lossy(&attr.value), err)));
                     if let Some(i) = value.rfind("::") {
                       value = value.split_off(i+2);
                     }
@@ -319,7 +333,7 @@ fn main() -> std::io::Result<()> {
                     }
                   },
                   Ok("srsDimension") => {
-                    let value = reader.decode(&attr.value).unwrap();
+                    let value = reader.decode(&attr.value).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute '{}': {}", String::from_utf8_lossy(&attr.value), err));
                     match value.parse::<u8>() {
                       Ok(int) => {
                         if let Some(geom) = gmlcoll.last_mut() { geom.dims = int };
@@ -397,14 +411,14 @@ fn main() -> std::io::Result<()> {
       Ok(Event::Text(ref e)) => {
         if filtered || skipped { continue; }
         if xmltotext {
-          text.push_str(&e.unescape_and_decode(&reader).unwrap());
+          text.push_str(&e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)));
           continue;
         }
         else if gmltoewkb {
           if gmlpos {
-            let value = String::from(&e.unescape_and_decode(&reader).unwrap());
+            let value = String::from(&e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML gmlpos '{}': {}", String::from_utf8_lossy(e), err)));
             for pos in value.split(' ') {
-              gmlcoll.last_mut().unwrap().rings.last_mut().unwrap().push(pos.parse().unwrap());
+              gmlcoll.last_mut().unwrap().rings.last_mut().unwrap().push(pos.parse().unwrap_or_else(|err| fatalerr!("Error: failed to parse GML pos '{}' into float: {}", pos, err)));
             }
           }
           continue;
@@ -430,7 +444,7 @@ fn main() -> std::io::Result<()> {
                 break;
               }
             }
-            table.columns[i].value.borrow_mut().push_str(&e.unescape_and_decode(&reader).unwrap().replace("\\", "\\\\"));
+            table.columns[i].value.borrow_mut().push_str(&e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)).replace("\\", "\\\\"));
             if let Some(re) = &table.columns[i].include {
               if !re.is_match(&table.columns[i].value.borrow()) {
                 filtered = true;
@@ -514,7 +528,7 @@ fn main() -> std::io::Result<()> {
         }
       },
       Ok(Event::Eof) => break,
-      Err(e) => panic!("Error at position {}: {:?}", reader.buffer_position(), e),
+      Err(e) => fatalerr!("Error: failed to parse XML at position {}: {}", reader.buffer_position(), e),
       _ => ()
     }
     buf.clear();
@@ -525,5 +539,4 @@ fn main() -> std::io::Result<()> {
     match filtercount { 0 => "".to_owned(), n => format!(" ({} excluded)", n) },
     match skipcount { 0 => "".to_owned(), n => format!(" ({} skipped)", n) }
   );
-  Ok(())
 }
