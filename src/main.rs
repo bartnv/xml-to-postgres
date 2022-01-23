@@ -476,7 +476,11 @@ fn main() {
 
             // Now write out the other column values
             for i in 0..table.columns.len() {
-              if table.columns[i].hide || table.columns[i].subtable.is_some() { continue; }
+              if table.columns[i].subtable.is_some() { continue; }
+              if table.columns[i].hide {
+                table.columns[i].value.borrow_mut().clear();
+                continue;
+              }
               if i > 0 { table.write("\t"); }
               if table.columns[i].value.borrow().is_empty() { table.write("\\N"); }
               else {
