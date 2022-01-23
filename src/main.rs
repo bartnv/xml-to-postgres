@@ -30,8 +30,11 @@ struct Table<'a> {
 }
 impl<'a> Table<'a> {
   fn new(path: &str, file: Option<&str>, filemode: &str, skip: Option<&'a str>) -> Table<'a> {
+    let mut ownpath = String::from(path);
+    if !ownpath.starts_with("/") { ownpath.insert(0, '/'); }
+    if ownpath.ends_with("/") { ownpath.pop(); }
     Table {
-      path: String::from(path),
+      path: ownpath,
       file: match file {
         None => RefCell::new(Box::new(stdout())),
         Some(ref file) => RefCell::new(Box::new(
@@ -127,7 +130,7 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, m
       2 => 32, // Indicate EWKB where the srid follows this byte
       3 => 32 | 128, // Add bit to indicate the presence of Z values
       _ => {
-        eprintln!("GML number of dimensions {} not supported", geom.dims);
+        eprintln!("Warning: GML number of dimensions {} not supported", geom.dims);
         32
       }
     };
@@ -182,8 +185,10 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
   for col in colspec {
     let name = col["name"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'name' entry in configuration file"));
     let colpath = col["path"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'path' entry in configuration file"));
-    let mut path = String::from(rowpath);
+    let mut path = String::from(&table.path);
+    if !colpath.starts_with("/") { path.push('/'); }
     path.push_str(colpath);
+    if path.ends_with("/") { path.pop(); }
     let subtable: Option<Table> = match col["cols"].is_badvalue() {
       true => None,
       false => {
