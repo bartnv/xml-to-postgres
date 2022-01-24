@@ -27,7 +27,7 @@ Basic usage:
 
     xml-to-postgres <config.yml> [data.xml]
 
-So the YAML configuration file is a required argument. The XML input file can be passed in as the second argument or can be sent to stdin if omitted.
+So the YAML configuration file is a required argument. The XML input file can be passed in as the second argument or will be read from stdin if omitted.
 
 Example invocation:
 
@@ -40,6 +40,10 @@ Within a pipeline:
 Within a database transaction:
 
     xml-to-postgres config.yml data.xml | psql <database> -c 'BEGIN' -c 'TRUNCATE <table>' -c '\copy <table> from stdin' -c 'COMMIT'
+
+Read multiple files in one go:
+
+    cat *.xml | xml-to-postgres config.yml > data.dump
 
 ## Configuration
 
