@@ -31,7 +31,7 @@ struct Table<'a> {
 impl<'a> Table<'a> {
   fn new(path: &str, file: Option<&str>, filemode: &str, skip: Option<&'a str>) -> Table<'a> {
     let mut ownpath = String::from(path);
-    if !ownpath.starts_with("/") { ownpath.insert(0, '/'); }
+    if !ownpath.is_empty() && !ownpath.starts_with("/") { ownpath.insert(0, '/'); }
     if ownpath.ends_with("/") { ownpath.pop(); }
     Table {
       path: ownpath,
@@ -186,7 +186,7 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
     let name = col["name"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'name' entry in configuration file"));
     let colpath = col["path"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'path' entry in configuration file"));
     let mut path = String::from(&table.path);
-    if !colpath.starts_with("/") { path.push('/'); }
+    if !colpath.is_empty() && !colpath.starts_with("/") { path.push('/'); }
     path.push_str(colpath);
     if path.ends_with("/") { path.pop(); }
     let subtable: Option<Table> = match col["cols"].is_badvalue() {
@@ -353,10 +353,9 @@ fn main() {
           }
           continue;
         }
-        else if path == table.path {
-          fullcount += 1;
-        }
-        else if path.len() > table.path.len() {
+        else if path.len() >= table.path.len() {
+          if path == table.path { fullcount += 1; }
+
           for i in 0..table.columns.len() {
             if path == table.columns[i].path { // This start tag matches one of the defined columns
 
