@@ -12,6 +12,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cow-utils"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79bb3adfaf5f75d24b01aee375f7555907840fa2800e5ec8fa3b9e2031830173"
+
+[[package]]
 name = "lazy_static"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -59,6 +65,7 @@ checksum = "f497285884f3fcff424ffc933e56d7cbca511def0c9831a7f9b5f6153e3cc89b"
 name = "xml-to-postgres"
 version = "1.0.0"
 dependencies = [
+ "cow-utils",
  "lazy_static",
  "quick-xml",
  "regex",

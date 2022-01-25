@@ -10,6 +10,7 @@ use yaml_rust::YamlLoader;
 use yaml_rust::yaml::Yaml;
 use regex::Regex;
 use lazy_static::lazy_static;
+use cow_utils::CowUtils;
 
 macro_rules! fatalerr {
     () => ({
@@ -284,6 +285,7 @@ fn main() {
   let mut gmltoewkb = false;
   let mut gmlpos = false;
   let mut gmlcoll: Vec<Geometry> = vec![];
+
   let start = Instant::now();
   loop {
     match reader.read_event(&mut buf) {
@@ -448,7 +450,9 @@ fn main() {
                 break;
               }
             }
-            table.columns[i].value.borrow_mut().push_str(&e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)).replace("\\", "\\\\"));
+            let unescaped = e.unescaped().unwrap_or_else(|err| fatalerr!("Error: failed to unescape XML text node '{}': {}", String::from_utf8_lossy(e), err));
+            let decoded = reader.decode(&unescaped).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err));
+            table.columns[i].value.borrow_mut().push_str(&decoded.cow_replace("\\", "\\\\").cow_replace("\r", "\\r").cow_replace("\n", "\\n").cow_replace("\t", "\\t"));
             if let Some(re) = &table.columns[i].include {
               if !re.is_match(&table.columns[i].value.borrow()) {
                 filtered = true;
