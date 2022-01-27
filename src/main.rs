@@ -68,6 +68,7 @@ struct Column<'a> {
   hide: bool,
   include: Option<Regex>,
   exclude: Option<Regex>,
+  trim: bool,
   convert: Option<&'a str>,
   find: Option<&'a str>,
   replace: Option<&'a str>,
@@ -200,6 +201,7 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
     let hide = col["hide"].as_bool().unwrap_or(false);
     let include: Option<Regex> = col["incl"].as_str().map(|str| Regex::new(str).unwrap_or_else(|err| fatalerr!("Error: invalid regex in 'incl' entry in configuration file: {}", err)));
     let exclude: Option<Regex> = col["excl"].as_str().map(|str| Regex::new(str).unwrap_or_else(|err| fatalerr!("Error: invalid regex in 'excl' entry in configuration file: {}", err)));
+    let trim = col["trim"].as_bool().unwrap_or(false);
     let attr = col["attr"].as_str();
     let convert = col["conv"].as_str();
     let find = col["find"].as_str();
@@ -231,7 +233,7 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
       eprintln!("Warning: the bbox option has no function without conversion type 'gml-to-ekwb'");
     }
 
-    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, hide, include, exclude, convert, find, replace, consol, subtable, bbox, multitype };
+    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, hide, include, exclude, trim, convert, find, replace, consol, subtable, bbox, multitype };
     table.columns.push(column);
   }
   table
@@ -285,6 +287,7 @@ fn main() {
   let mut gmltoewkb = false;
   let mut gmlpos = false;
   let mut gmlcoll: Vec<Geometry> = vec![];
+  let trimre = Regex::new("[ \n\r\t]*\n[ \n\r\t]*").unwrap();
 
   let start = Instant::now();
   loop {
@@ -452,7 +455,13 @@ fn main() {
             }
             let unescaped = e.unescaped().unwrap_or_else(|err| fatalerr!("Error: failed to unescape XML text node '{}': {}", String::from_utf8_lossy(e), err));
             let decoded = reader.decode(&unescaped).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err));
-            table.columns[i].value.borrow_mut().push_str(&decoded.cow_replace("\\", "\\\\").cow_replace("\r", "\\r").cow_replace("\n", "\\n").cow_replace("\t", "\\t"));
+            if table.columns[i].trim {
+              let trimmed = trimre.replace_all(decoded, " ");
+              table.columns[i].value.borrow_mut().push_str(&trimmed.cow_replace("\\", "\\\\").cow_replace("\t", "\\t"));
+            }
+            else {
+              table.columns[i].value.borrow_mut().push_str(&decoded.cow_replace("\\", "\\\\").cow_replace("\r", "\\r").cow_replace("\n", "\\n").cow_replace("\t", "\\t"));
+            }
             if let Some(re) = &table.columns[i].include {
               if !re.is_match(&table.columns[i].value.borrow()) {
                 filtered = true;
