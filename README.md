@@ -47,4 +47,4 @@ Read multiple files in one go:
 
 ## Configuration
 
-See [documentation for the configuration file](https://github.com/bartnv/xml-to-postgres/wiki/Configuration-options) in the wiki.
+See the wiki for [documentation on the configuration file](https://github.com/bartnv/xml-to-postgres/wiki/Configuration-options) and a [basic example](https://github.com/bartnv/xml-to-postgres/wiki/Basic-example).
