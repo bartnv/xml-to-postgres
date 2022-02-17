@@ -23,23 +23,32 @@ macro_rules! fatalerr {
     });
 }
 
+struct Settings {
+  filemode: String,
+  skip: String,
+  emit_copyfrom: bool,
+  emit_createtable: bool
+}
+
 struct Table<'a> {
+  name: String,
   path: String,
   file: RefCell<Box<dyn Write>>,
-  skip: String,
-  columns: Vec<Column<'a>>
+  columns: Vec<Column<'a>>,
+  emit_copyfrom: bool
 }
 impl<'a> Table<'a> {
-  fn new(path: &str, file: Option<&str>, filemode: &str, skip: Option<&'a str>) -> Table<'a> {
+  fn new(name: &str, path: &str, file: Option<&str>, settings: &Settings) -> Table<'a> {
     let mut ownpath = String::from(path);
     if !ownpath.is_empty() && !ownpath.starts_with('/') { ownpath.insert(0, '/'); }
     if ownpath.ends_with('/') { ownpath.pop(); }
     Table {
+      name: name.to_owned(),
       path: ownpath,
       file: match file {
         None => RefCell::new(Box::new(stdout())),
         Some(ref file) => RefCell::new(Box::new(
-          match filemode {
+          match settings.filemode.as_ref() {
             "truncate" => File::create(&Path::new(file)).unwrap_or_else(|err| fatalerr!("Error: failed to create output file '{}': {}", file, err)),
             "append" => OpenOptions::new().append(true).create(true).open(&Path::new(file)).unwrap_or_else(|err| fatalerr!("Error: failed to open output file '{}': {}", file, err)),
             mode => fatalerr!("Error: invalid 'mode' setting in configuration file: {}", mode)
@@ -47,7 +56,7 @@ impl<'a> Table<'a> {
         ))
       },
       columns: Vec::new(),
-      skip: match skip { Some(s) => format!("{}{}", path, s), None => String::new() }
+      emit_copyfrom: settings.emit_copyfrom
     }
   }
   fn write(&self, text: &str) {
@@ -59,10 +68,16 @@ impl<'a> Table<'a> {
     }
   }
 }
+impl<'a> Drop for Table<'a> {
+  fn drop(&mut self) {
+    if self.emit_copyfrom { self.write("\\.\n"); }
+  }
+}
 
 struct Column<'a> {
   name: String,
   path: String,
+  datatype: String,
   value: RefCell<String>,
   attr: Option<&'a str>,
   hide: bool,
@@ -76,6 +91,11 @@ struct Column<'a> {
   subtable: Option<Table<'a>>,
   bbox: Option<BBox>,
   multitype: bool
+}
+impl std::borrow::Borrow<str> for Column<'_> {
+  fn borrow(&self) -> &str {
+    &*self.name
+  }
 }
 impl std::fmt::Debug for Column<'_> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -182,20 +202,21 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, m
   true
 }
 
-fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Option<&'a str>, colspec: &'a [Yaml]) -> Table<'a> {
-  let mut table = Table::new(rowpath, outfile, filemode, skip);
+fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Settings, colspec: &'a [Yaml]) -> Table<'a> {
+  let mut table = Table::new(name, rowpath, outfile, settings);
   for col in colspec {
-    let name = col["name"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'name' entry in configuration file"));
+    let colname = col["name"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'name' entry in configuration file"));
     let colpath = col["path"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'path' entry in configuration file"));
     let mut path = String::from(&table.path);
     if !colpath.is_empty() && !colpath.starts_with('/') { path.push('/'); }
     path.push_str(colpath);
     if path.ends_with('/') { path.pop(); }
+    let datatype = col["type"].as_str().unwrap_or("text").to_string();
     let subtable: Option<Table> = match col["cols"].is_badvalue() {
       true => None,
       false => {
         let file = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable has no 'file' entry"));
-        Some(add_table(&path, Some(file), filemode, skip, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array"))))
+        Some(add_table(colname, &path, Some(file), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array"))))
       }
     };
     let hide = col["hide"].as_bool().unwrap_or(false);
@@ -233,8 +254,15 @@ fn add_table<'a>(rowpath: &str, outfile: Option<&str>, filemode: &str, skip: Opt
       eprintln!("Warning: the bbox option has no function without conversion type 'gml-to-ekwb'");
     }
 
-    let column = Column { name: name.to_string(), path, value: RefCell::new(String::new()), attr, hide, include, exclude, trim, convert, find, replace, consol, subtable, bbox, multitype };
+    let column = Column { name: colname.to_string(), path, datatype, value: RefCell::new(String::new()), attr, hide, include, exclude, trim, convert, find, replace, consol, subtable, bbox, multitype };
     table.columns.push(column);
+  }
+  if settings.emit_createtable {
+    let cols = table.columns.iter().map(|c| { let mut spec = String::from(&c.name); spec.push(' '); spec.push_str(&c.datatype); spec }).collect::<Vec<String>>().join(", ");
+    table.write(&format!("CREATE TABLE IF NOT EXISTS {} ({});\n", name, cols));
+  }
+  if settings.emit_copyfrom {
+    table.write(&format!("COPY {} ({}) FROM stdin;\n", name, table.columns.join(", ")));
   }
   table
 }
@@ -268,15 +296,22 @@ fn main() {
   let mut filtercount = 0;
   let mut skipcount = 0;
 
+  let name = config["name"].as_str().unwrap_or_else(|| fatalerr!("Error: no valid 'name' entry in configuration file"));
   let rowpath = config["path"].as_str().unwrap_or_else(|| fatalerr!("Error: no valid 'path' entry in configuration file"));
   let colspec = config["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: no valid 'cols' array in configuration file"));
   let outfile = config["file"].as_str();
-  let filemode = match config["mode"].is_badvalue() {
-    true => "truncate",
-    false => config["mode"].as_str().unwrap_or_else(|| fatalerr!("Error: invalid 'mode' entry in configuration file"))
+  let emit = config["emit"].as_str().unwrap_or("");
+  let mut settings = Settings {
+    filemode: config["mode"].as_str().unwrap_or("truncate").to_owned(),
+    skip: config["skip"].as_str().unwrap_or("").to_owned(),
+    emit_copyfrom: emit.contains("copy_from") || emit.contains("create_table"),
+    emit_createtable: emit.contains("create_table")
   };
-  let skip = config["skip"].as_str();
-  let maintable = add_table(rowpath, outfile, filemode, skip, colspec);
+  let maintable = add_table(name, rowpath, outfile, &settings, colspec);
+  if !settings.skip.is_empty() {
+    if !settings.skip.starts_with('/') { settings.skip.insert(0, '/'); }
+    settings.skip.insert_str(0, &maintable.path); // Maintable path is normalized in add_table()
+  }
   let mut tables: Vec<&Table> = Vec::new();
   let mut table = &maintable;
 
@@ -296,7 +331,7 @@ fn main() {
         path.push('/');
         path.push_str(reader.decode(e.name()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name()), err)));
         if filtered || skipped { continue; }
-        if path == table.skip {
+        if path == settings.skip {
           skipped = true;
           continue;
         }
@@ -513,7 +548,7 @@ fn main() {
             if !tables.is_empty() { table = tables.pop().unwrap(); }
           }
         }
-        else if path == table.skip {
+        else if skipped && path == settings.skip {
           skipped = false;
           skipcount += 1;
         }
