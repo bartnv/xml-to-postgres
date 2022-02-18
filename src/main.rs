@@ -27,7 +27,10 @@ struct Settings {
   filemode: String,
   skip: String,
   emit_copyfrom: bool,
-  emit_createtable: bool
+  emit_createtable: bool,
+  emit_starttransaction: bool,
+  emit_truncate: bool,
+  emit_droptable: bool
 }
 
 struct Table<'a> {
@@ -35,7 +38,8 @@ struct Table<'a> {
   path: String,
   file: RefCell<Box<dyn Write>>,
   columns: Vec<Column<'a>>,
-  emit_copyfrom: bool
+  emit_copyfrom: bool,
+  emit_starttransaction: bool
 }
 impl<'a> Table<'a> {
   fn new(name: &str, path: &str, file: Option<&str>, settings: &Settings) -> Table<'a> {
@@ -56,7 +60,8 @@ impl<'a> Table<'a> {
         ))
       },
       columns: Vec::new(),
-      emit_copyfrom: settings.emit_copyfrom
+      emit_copyfrom: settings.emit_copyfrom,
+      emit_starttransaction: settings.emit_starttransaction
     }
   }
   fn write(&self, text: &str) {
@@ -71,6 +76,7 @@ impl<'a> Table<'a> {
 impl<'a> Drop for Table<'a> {
   fn drop(&mut self) {
     if self.emit_copyfrom { self.write("\\.\n"); }
+    if self.emit_starttransaction { self.write("COMMIT;\n"); }
   }
 }
 
@@ -257,9 +263,18 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     let column = Column { name: colname.to_string(), path, datatype, value: RefCell::new(String::new()), attr, hide, include, exclude, trim, convert, find, replace, consol, subtable, bbox, multitype };
     table.columns.push(column);
   }
+  if settings.emit_starttransaction {
+    table.write("START TRANSACTION;\n");
+  }
+  if settings.emit_droptable {
+    table.write(&format!("DROP TABLE IF EXISTS {};\n", name));
+  }
   if settings.emit_createtable {
     let cols = table.columns.iter().map(|c| { let mut spec = String::from(&c.name); spec.push(' '); spec.push_str(&c.datatype); spec }).collect::<Vec<String>>().join(", ");
     table.write(&format!("CREATE TABLE IF NOT EXISTS {} ({});\n", name, cols));
+  }
+  if settings.emit_truncate {
+    table.write(&format!("TRUNCATE {};\n", name));
   }
   if settings.emit_copyfrom {
     table.write(&format!("COPY {} ({}) FROM stdin;\n", name, table.columns.join(", ")));
@@ -304,8 +319,11 @@ fn main() {
   let mut settings = Settings {
     filemode: config["mode"].as_str().unwrap_or("truncate").to_owned(),
     skip: config["skip"].as_str().unwrap_or("").to_owned(),
-    emit_copyfrom: emit.contains("copy_from") || emit.contains("create_table"),
-    emit_createtable: emit.contains("create_table")
+    emit_copyfrom: emit.contains("copy_from") || emit.contains("create_table") || emit.contains("start_trans") || emit.contains("truncate") || emit.contains("drop_table"),
+    emit_createtable: emit.contains("create_table"),
+    emit_starttransaction: emit.contains("start_trans"),
+    emit_truncate: emit.contains("truncate"),
+    emit_droptable: emit.contains("drop_table")
   };
   let maintable = add_table(name, rowpath, outfile, &settings, colspec);
   if !settings.skip.is_empty() {
