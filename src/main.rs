@@ -208,7 +208,7 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, m
   true
 }
 
-fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Settings, colspec: &'a [Yaml]) -> Table<'a> {
+fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Settings, colspec: &'a [Yaml], fkey: Option<String>) -> Table<'a> {
   let mut table = Table::new(name, rowpath, outfile, settings);
   for col in colspec {
     let colname = col["name"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'name' entry in configuration file"));
@@ -222,7 +222,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       true => None,
       false => {
         let file = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable has no 'file' entry"));
-        Some(add_table(colname, &path, Some(file), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array"))))
+        Some(add_table(colname, &path, Some(file), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), Some(format!("{} {}", name, table.columns[0].datatype))))
       }
     };
     let hide = col["hide"].as_bool().unwrap_or(false);
@@ -270,14 +270,18 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     table.write(&format!("DROP TABLE IF EXISTS {};\n", name));
   }
   if settings.emit_createtable {
-    let cols = table.columns.iter().map(|c| { let mut spec = String::from(&c.name); spec.push(' '); spec.push_str(&c.datatype); spec }).collect::<Vec<String>>().join(", ");
+    let mut cols = table.columns.iter().map(|c| { let mut spec = String::from(&c.name); spec.push(' '); spec.push_str(&c.datatype); spec }).collect::<Vec<String>>().join(", ");
+    if fkey.is_some() { cols.insert_str(0, &format!("{}, ", fkey.as_ref().unwrap())); }
     table.write(&format!("CREATE TABLE IF NOT EXISTS {} ({});\n", name, cols));
   }
   if settings.emit_truncate {
     table.write(&format!("TRUNCATE {};\n", name));
   }
   if settings.emit_copyfrom {
-    table.write(&format!("COPY {} ({}) FROM stdin;\n", name, table.columns.join(", ")));
+    if fkey.is_some() {
+      table.write(&format!("COPY {} ({}, {}) FROM stdin;\n", name, fkey.unwrap().split(' ').next().unwrap(), table.columns.join(", ")));
+    }
+    else { table.write(&format!("COPY {} ({}) FROM stdin;\n", name, table.columns.join(", "))); }
   }
   table
 }
@@ -325,7 +329,7 @@ fn main() {
     emit_truncate: emit.contains("truncate"),
     emit_droptable: emit.contains("drop_table")
   };
-  let maintable = add_table(name, rowpath, outfile, &settings, colspec);
+  let maintable = add_table(name, rowpath, outfile, &settings, colspec, None);
   if !settings.skip.is_empty() {
     if !settings.skip.starts_with('/') { settings.skip.insert(0, '/'); }
     settings.skip.insert_str(0, &maintable.path); // Maintable path is normalized in add_table()
