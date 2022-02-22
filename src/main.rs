@@ -242,7 +242,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
         fatalerr!("Error: option 'convert' contains invalid value: {}", val);
       }
       if val == "gml-to-ewkb" {
-        eprintln!("Warning: gml-to-ewkb conversion is experimental and in no way complete or standards compliant; use at your own risk");
+        eprintln!("Notice: gml-to-ewkb conversion is experimental and in no way complete or standards compliant; use at your own risk");
       }
     }
     if include.is_some() || exclude.is_some() {
@@ -378,7 +378,7 @@ fn main() {
               "gml:LinearRing" => gmlcoll.last_mut().unwrap().rings.push(Vec::new()),
               "gml:posList" => gmlpos = true,
               "gml:pos" => gmlpos = true,
-              _ => eprintln!("GML type {} not supported", tag)
+              _ => eprintln!("Warning: GML type {} not supported", tag)
             }
           }
           for res in e.attributes() {
@@ -396,7 +396,7 @@ fn main() {
                       Ok(int) => {
                         if let Some(geom) = gmlcoll.last_mut() { geom.srid = int };
                       },
-                      Err(_) => eprintln!("Invalid srsName {} in GML", value)
+                      Err(_) => eprintln!("Warning: invalid srsName {} in GML", value)
                     }
                   },
                   Ok("srsDimension") => {
@@ -405,7 +405,7 @@ fn main() {
                       Ok(int) => {
                         if let Some(geom) = gmlcoll.last_mut() { geom.dims = int };
                       },
-                      Err(_) => eprintln!("Invalid srsDimension {} in GML", value)
+                      Err(_) => eprintln!("Warning: invalid srsDimension {} in GML", value)
                     }
                   }
                   _ => ()
@@ -437,16 +437,16 @@ fn main() {
                         if let Ok(value) = reader.decode(&attr.value) {
                           table.columns[i].value.borrow_mut().push_str(value)
                         }
-                        else { eprintln!("Failed to decode attribute {} for column {}", request, table.columns[i].name); }
+                        else { eprintln!("Warning: failed to decode attribute {} for column {}", request, table.columns[i].name); }
                         break;
                       }
                     }
-                    else { eprintln!("Failed to decode an attribute for column {}", table.columns[i].name); }
+                    else { eprintln!("Warning: failed to decode an attribute for column {}", table.columns[i].name); }
                   }
-                  else { eprintln!("Error reading attributes for column {}", table.columns[i].name); }
+                  else { eprintln!("Warning: failed to read attributes for column {}", table.columns[i].name); }
                 }
                 if table.columns[i].value.borrow().is_empty() {
-                  eprintln!("Column {} requested attribute {} not found", table.columns[i].name, request);
+                  eprintln!("Warning: column {} requested attribute {} not found", table.columns[i].name, request);
                 }
                 if let Some(re) = &table.columns[i].include {
                   if !re.is_match(&table.columns[i].value.borrow()) {
@@ -495,7 +495,7 @@ fn main() {
             match table.columns[i].consol {
               None => {
                 if !table.columns[i].value.borrow().is_empty() {
-                  eprintln!("Column '{}' has multiple occurrences without a consolidation method; using 'first'", table.columns[i].name);
+                  eprintln!("Warning: column '{}' has multiple occurrences without a consolidation method; using 'first'", table.columns[i].name);
                   break;
                 }
               },
@@ -506,7 +506,7 @@ fn main() {
                 if !table.columns[i].value.borrow().is_empty() { table.columns[i].value.borrow_mut().push(','); }
               },
               Some(s) => {
-                eprintln!("Column '{}' has invalid consolidation method {}", table.columns[i].name, s);
+                eprintln!("Warning: column '{}' has invalid consolidation method {}", table.columns[i].name, s);
                 break;
               }
             }
