@@ -30,7 +30,10 @@ struct Settings {
   emit_createtable: bool,
   emit_starttransaction: bool,
   emit_truncate: bool,
-  emit_droptable: bool
+  emit_droptable: bool,
+  hush_info: bool,
+  hush_notice: bool,
+  hush_warning: bool
 }
 
 struct Table<'a> {
@@ -143,7 +146,7 @@ impl BBox {
   }
 }
 
-fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, multitype: bool) -> bool {
+fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, multitype: bool, settings: &Settings) -> bool {
   let mut ewkb: Vec<u8> = vec![];
 
   if multitype || coll.len() > 1 {
@@ -158,7 +161,7 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, m
       2 => 32, // Indicate EWKB where the srid follows this byte
       3 => 32 | 128, // Add bit to indicate the presence of Z values
       _ => {
-        eprintln!("Warning: GML number of dimensions {} not supported", geom.dims);
+        if !settings.hush_warning { eprintln!("Warning: GML number of dimensions {} not supported", geom.dims); }
         32
       }
     };
@@ -241,7 +244,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       if !vec!("xml-to-text", "gml-to-ewkb").contains(&val) {
         fatalerr!("Error: option 'convert' contains invalid value: {}", val);
       }
-      if val == "gml-to-ewkb" {
+      if val == "gml-to-ewkb" && !settings.hush_notice {
         eprintln!("Notice: gml-to-ewkb conversion is experimental and in no way complete or standards compliant; use at your own risk");
       }
     }
@@ -249,14 +252,14 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       if convert.is_some() {
         fatalerr!("Error: filtering (incl/excl) and 'conv' cannot be used together on a single column");
       }
-      if find.is_some() {
+      if find.is_some() && !settings.hush_notice {
         eprintln!("Notice: when using filtering (incl/excl) and find/replace on a single column, the filter is checked before replacements");
       }
-      if consol.is_some() {
+      if consol.is_some() && !settings.hush_notice {
         eprintln!("Notice: when using filtering (incl/excl) and consolidation on a single column, the filter is checked at each phase of consolidation separately");
       }
     }
-    if bbox.is_some() && (convert.is_none() || convert.unwrap() != "gml-to-ewkb") {
+    if bbox.is_some() && (convert.is_none() || convert.unwrap() != "gml-to-ewkb") && !settings.hush_warning {
       eprintln!("Warning: the bbox option has no function without conversion type 'gml-to-ekwb'");
     }
 
@@ -320,6 +323,7 @@ fn main() {
   let colspec = config["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: no valid 'cols' array in configuration file"));
   let outfile = config["file"].as_str();
   let emit = config["emit"].as_str().unwrap_or("");
+  let hush = config["hush"].as_str().unwrap_or("");
   let mut settings = Settings {
     filemode: config["mode"].as_str().unwrap_or("truncate").to_owned(),
     skip: config["skip"].as_str().unwrap_or("").to_owned(),
@@ -327,7 +331,10 @@ fn main() {
     emit_createtable: emit.contains("create_table"),
     emit_starttransaction: emit.contains("start_trans"),
     emit_truncate: emit.contains("truncate"),
-    emit_droptable: emit.contains("drop_table")
+    emit_droptable: emit.contains("drop_table"),
+    hush_info: hush.contains("info"),
+    hush_notice: hush.contains("notice"),
+    hush_warning: hush.contains("warning")
   };
   let maintable = add_table(name, rowpath, outfile, &settings, colspec, None);
   if !settings.skip.is_empty() {
@@ -378,7 +385,7 @@ fn main() {
               "gml:LinearRing" => gmlcoll.last_mut().unwrap().rings.push(Vec::new()),
               "gml:posList" => gmlpos = true,
               "gml:pos" => gmlpos = true,
-              _ => eprintln!("Warning: GML type {} not supported", tag)
+              _ => if !settings.hush_warning { eprintln!("Warning: GML type {} not supported", tag); }
             }
           }
           for res in e.attributes() {
@@ -396,7 +403,7 @@ fn main() {
                       Ok(int) => {
                         if let Some(geom) = gmlcoll.last_mut() { geom.srid = int };
                       },
-                      Err(_) => eprintln!("Warning: invalid srsName {} in GML", value)
+                      Err(_) => if !settings.hush_warning { eprintln!("Warning: invalid srsName {} in GML", value); }
                     }
                   },
                   Ok("srsDimension") => {
@@ -405,7 +412,7 @@ fn main() {
                       Ok(int) => {
                         if let Some(geom) = gmlcoll.last_mut() { geom.dims = int };
                       },
-                      Err(_) => eprintln!("Warning: invalid srsDimension {} in GML", value)
+                      Err(_) => if !settings.hush_warning { eprintln!("Warning: invalid srsDimension {} in GML", value); }
                     }
                   }
                   _ => ()
@@ -437,15 +444,15 @@ fn main() {
                         if let Ok(value) = reader.decode(&attr.value) {
                           table.columns[i].value.borrow_mut().push_str(value)
                         }
-                        else { eprintln!("Warning: failed to decode attribute {} for column {}", request, table.columns[i].name); }
+                        else if !settings.hush_warning { eprintln!("Warning: failed to decode attribute {} for column {}", request, table.columns[i].name); }
                         break;
                       }
                     }
-                    else { eprintln!("Warning: failed to decode an attribute for column {}", table.columns[i].name); }
+                    else if !settings.hush_warning { eprintln!("Warning: failed to decode an attribute for column {}", table.columns[i].name); }
                   }
-                  else { eprintln!("Warning: failed to read attributes for column {}", table.columns[i].name); }
+                  else if !settings.hush_warning { eprintln!("Warning: failed to read attributes for column {}", table.columns[i].name); }
                 }
-                if table.columns[i].value.borrow().is_empty() {
+                if table.columns[i].value.borrow().is_empty() && !settings.hush_warning {
                   eprintln!("Warning: column {} requested attribute {} not found", table.columns[i].name, request);
                 }
                 if let Some(re) = &table.columns[i].include {
@@ -494,7 +501,7 @@ fn main() {
             if table.columns[i].attr.is_some() { break; }
             match table.columns[i].consol {
               None => {
-                if !table.columns[i].value.borrow().is_empty() {
+                if !table.columns[i].value.borrow().is_empty() && !settings.hush_warning {
                   eprintln!("Warning: column '{}' has multiple occurrences without a consolidation method; using 'first'", table.columns[i].name);
                   break;
                 }
@@ -506,7 +513,7 @@ fn main() {
                 if !table.columns[i].value.borrow().is_empty() { table.columns[i].value.borrow_mut().push(','); }
               },
               Some(s) => {
-                eprintln!("Warning: column '{}' has invalid consolidation method {}", table.columns[i].name, s);
+                if !settings.hush_warning { eprintln!("Warning: column '{}' has invalid consolidation method {}", table.columns[i].name, s); }
                 break;
               }
             }
@@ -595,7 +602,7 @@ fn main() {
           for i in 0..table.columns.len() {
             if path == table.columns[i].path {
               gmltoewkb = false;
-              if !gml_to_ewkb(&table.columns[i].value, &gmlcoll, table.columns[i].bbox.as_ref(), table.columns[i].multitype) {
+              if !gml_to_ewkb(&table.columns[i].value, &gmlcoll, table.columns[i].bbox.as_ref(), table.columns[i].multitype, &settings) {
                 filtered = true;
                 table.clear_columns();
               }
@@ -611,11 +618,13 @@ fn main() {
     }
     buf.clear();
   }
-  eprintln!("Info: [{}] {} rows processed in {} seconds{}{}",
-    maintable.name,
-    fullcount-filtercount-skipcount,
-    start.elapsed().as_secs(),
-    match filtercount { 0 => "".to_owned(), n => format!(" ({} excluded)", n) },
-    match skipcount { 0 => "".to_owned(), n => format!(" ({} skipped)", n) }
-  );
+  if !settings.hush_info {
+    eprintln!("Info: [{}] {} rows processed in {} seconds{}{}",
+      maintable.name,
+      fullcount-filtercount-skipcount,
+      start.elapsed().as_secs(),
+      match filtercount { 0 => "".to_owned(), n => format!(" ({} excluded)", n) },
+      match skipcount { 0 => "".to_owned(), n => format!(" ({} skipped)", n) }
+    );
+  }
 }
