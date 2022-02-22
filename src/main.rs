@@ -611,7 +611,8 @@ fn main() {
     }
     buf.clear();
   }
-  eprintln!("{} rows processed in {} seconds{}{}",
+  eprintln!("Info: [{}] {} rows processed in {} seconds{}{}",
+    maintable.name,
     fullcount-filtercount-skipcount,
     start.elapsed().as_secs(),
     match filtercount { 0 => "".to_owned(), n => format!(" ({} excluded)", n) },
