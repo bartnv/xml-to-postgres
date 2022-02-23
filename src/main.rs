@@ -204,9 +204,12 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, m
     }
   }
 
+  static CHARS: &'static [u8] = b"0123456789ABCDEF";
   let mut value = cell.borrow_mut();
+  value.reserve(ewkb.len()*2);
   for byte in ewkb.iter() {
-    value.push_str(&format!("{:02X}", byte));
+    value.push(CHARS[(byte >>  4) as usize].into());
+    value.push(CHARS[(byte & 0xf) as usize].into());
   }
   true
 }
@@ -491,7 +494,7 @@ fn main() {
           if gmlpos {
             let value = String::from(&e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML gmlpos '{}': {}", String::from_utf8_lossy(e), err)));
             for pos in value.split(' ') {
-              gmlcoll.last_mut().unwrap().rings.last_mut().unwrap().push(pos.parse().unwrap_or_else(|err| fatalerr!("Error: failed to parse GML pos '{}' into float: {}", pos, err)));
+              gmlcoll.last_mut().unwrap().rings.last_mut().unwrap().push(fast_float::parse(pos).unwrap_or_else(|err| fatalerr!("Error: failed to parse GML pos '{}' into float: {}", pos, err)));
             }
           }
           continue;
