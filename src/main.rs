@@ -4,6 +4,8 @@ use std::path::Path;
 use std::env;
 use std::cell::RefCell;
 use std::time::Instant;
+use std::default::Default;
+use std::collections::HashMap;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use yaml_rust::YamlLoader;
@@ -83,6 +85,22 @@ impl<'a> Drop for Table<'a> {
   }
 }
 
+struct Domain<'a> {
+  lastid: u32,
+  map: HashMap<String, u32>,
+  table: Table<'a>
+}
+impl<'a> Domain<'a> {
+  fn new(tabname: &str, path: &str, filename: &str, settings: &Settings) -> Domain<'a> {
+    Domain {
+      lastid: 0,
+      map: HashMap::new(),
+      table: Table::new(tabname, path, Some(filename), settings)
+    }
+  }
+}
+
+#[derive(Default)]
 struct Column<'a> {
   name: String,
   path: String,
@@ -98,6 +116,7 @@ struct Column<'a> {
   replace: Option<&'a str>,
   aggr: Option<&'a str>,
   subtable: Option<Table<'a>>,
+  domain: Option<RefCell<Domain<'a>>>,
   bbox: Option<BBox>,
   multitype: bool
 }
@@ -204,7 +223,7 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, m
     }
   }
 
-  static CHARS: &'static [u8] = b"0123456789ABCDEF";
+  static CHARS: &[u8] = b"0123456789ABCDEF";
   let mut value = cell.borrow_mut();
   value.reserve(ewkb.len()*2);
   for byte in ewkb.iter() {
@@ -223,12 +242,12 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     if !colpath.is_empty() && !colpath.starts_with('/') { path.push('/'); }
     path.push_str(colpath);
     if path.ends_with('/') { path.pop(); }
-    let datatype = col["type"].as_str().unwrap_or("text").to_string();
+    let mut datatype = col["type"].as_str().unwrap_or("text").to_string();
     let subtable: Option<Table> = match col["cols"].is_badvalue() {
       true => None,
       false => {
-        let file = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable has no 'file' entry"));
-        Some(add_table(colname, &path, Some(file), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), Some(format!("{} {}", name, table.columns[0].datatype))))
+        let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable has no 'file' entry"));
+        Some(add_table(colname, &path, Some(filename), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), Some(format!("{} {}", name, table.columns[0].datatype))))
       }
     };
     let hide = col["hide"].as_bool().unwrap_or(false);
@@ -240,6 +259,19 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     let find = col["find"].as_str();
     let replace = col["repl"].as_str();
     let aggr = col["aggr"].as_str();
+    let norm = col["norm"].as_bool().unwrap_or(false);
+    let domain = match norm {
+      true => {
+        let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: option 'norm' requires a 'file' entry"));
+        let mut domain = Domain::new(colname, colpath, filename, settings);
+        domain.table.columns.push(Column { name: String::from("id"), path: String::new(), datatype: String::from("integer"), ..Default::default()});
+        domain.table.columns.push(Column { name: String::from("value"), path: String::new(), datatype, ..Default::default()});
+        emit_preamble(&domain.table, settings, None);
+        datatype = String::from("integer");
+        Some(RefCell::new(domain))
+      },
+      false => None
+    };
     let bbox = col["bbox"].as_str().and_then(BBox::from);
     let multitype = col["mult"].as_bool().unwrap_or(false);
 
@@ -266,7 +298,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       eprintln!("Warning: the bbox option has no function without conversion type 'gml-to-ekwb'");
     }
 
-    let column = Column { name: colname.to_string(), path, datatype, value: RefCell::new(String::new()), attr, hide, include, exclude, trim, convert, find, replace, aggr, subtable, bbox, multitype };
+    let column = Column { name: colname.to_string(), path, datatype, value: RefCell::new(String::new()), attr, hide, include, exclude, trim, convert, find, replace, aggr, subtable, domain, bbox, multitype };
     table.columns.push(column);
   }
 
@@ -570,6 +602,21 @@ fn main() {
                 }
                 if i > 0 { table.write("\t"); }
                 if table.columns[i].value.borrow().is_empty() { table.write("\\N"); }
+                else if let Some(domain) = table.columns[i].domain.as_ref() {
+                  let mut domain = domain.borrow_mut();
+                  let id = match domain.map.get(&table.columns[i].value.borrow().to_string()) {
+                    Some(id) => *id,
+                    None => {
+                      domain.lastid += 1;
+                      let id = domain.lastid;
+                      domain.map.insert(table.columns[i].value.borrow().to_string(), id);
+                      domain.table.write(&format!("{}\t{}\n", id, table.columns[i].value.borrow()));
+                      id
+                    }
+                  };
+                  table.write(&format!("{}", id));
+                  table.columns[i].value.borrow_mut().clear();
+                }
                 else {
                   if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
                     let mut value = table.columns[i].value.borrow_mut();
