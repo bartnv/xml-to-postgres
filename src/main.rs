@@ -269,27 +269,38 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     let column = Column { name: colname.to_string(), path, datatype, value: RefCell::new(String::new()), attr, hide, include, exclude, trim, convert, find, replace, consol, subtable, bbox, multitype };
     table.columns.push(column);
   }
+
+  emit_preamble(&table, settings, fkey);
+  table
+}
+fn emit_preamble(table: &Table, settings: &Settings, fkey: Option<String>) {
   if settings.emit_starttransaction {
     table.write("START TRANSACTION;\n");
   }
   if settings.emit_droptable {
-    table.write(&format!("DROP TABLE IF EXISTS {};\n", name));
+    table.write(&format!("DROP TABLE IF EXISTS {};\n", table.name));
   }
   if settings.emit_createtable {
-    let mut cols = table.columns.iter().map(|c| { let mut spec = String::from(&c.name); spec.push(' '); spec.push_str(&c.datatype); spec }).collect::<Vec<String>>().join(", ");
+    let mut cols = table.columns.iter().filter_map(|c| {
+      if c.subtable.is_some() { return None; }
+      let mut spec = String::from(&c.name);
+      spec.push(' ');
+      spec.push_str(&c.datatype);
+      Some(spec)
+    }).collect::<Vec<String>>().join(", ");
     if fkey.is_some() { cols.insert_str(0, &format!("{}, ", fkey.as_ref().unwrap())); }
-    table.write(&format!("CREATE TABLE IF NOT EXISTS {} ({});\n", name, cols));
+    table.write(&format!("CREATE TABLE IF NOT EXISTS {} ({});\n", table.name, cols));
   }
   if settings.emit_truncate {
-    table.write(&format!("TRUNCATE {};\n", name));
+    table.write(&format!("TRUNCATE {};\n", table.name));
   }
   if settings.emit_copyfrom {
+    let cols = table.columns.iter().filter_map(|c| match c.subtable { None=> Some(String::from(&c.name)), Some(_) => None }).collect::<Vec<String>>().join(", ");
     if fkey.is_some() {
-      table.write(&format!("COPY {} ({}, {}) FROM stdin;\n", name, fkey.unwrap().split(' ').next().unwrap(), table.columns.join(", ")));
+      table.write(&format!("COPY {} ({}, {}) FROM stdin;\n", table.name, fkey.unwrap().split(' ').next().unwrap(), cols));
     }
-    else { table.write(&format!("COPY {} ({}) FROM stdin;\n", name, table.columns.join(", "))); }
+    else { table.write(&format!("COPY {} ({}) FROM stdin;\n", table.name, cols)); }
   }
-  table
 }
 
 fn main() {
