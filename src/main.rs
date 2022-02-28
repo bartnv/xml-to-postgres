@@ -368,252 +368,264 @@ fn main() {
   let trimre = Regex::new("[ \n\r\t]*\n[ \n\r\t]*").unwrap();
 
   let start = Instant::now();
-  loop {
-    match reader.read_event(&mut buf) {
-      Ok(Event::Start(ref e)) => {
-        path.push('/');
-        path.push_str(reader.decode(e.name()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name()), err)));
-        if filtered || skipped { continue; }
-        if path == settings.skip {
-          skipped = true;
-          continue;
-        }
-        else if xmltotext {
-          text.push_str(&format!("<{}>", &e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name()), err))));
-          continue;
-        }
-        else if gmltoewkb {
-          match reader.decode(e.name()) {
-            Err(_) => (),
-            Ok(tag) => match tag {
-              "gml:Point" => {
-                gmlcoll.push(Geometry::new(1));
-                gmlcoll.last_mut().unwrap().rings.push(Vec::new());
-              },
-              "gml:LineString" => gmlcoll.push(Geometry::new(2)),
-              "gml:Polygon" => gmlcoll.push(Geometry::new(3)),
-              "gml:MultiPolygon" => (),
-              "gml:polygonMember" => (),
-              "gml:exterior" => (),
-              "gml:interior" => (),
-              "gml:LinearRing" => gmlcoll.last_mut().unwrap().rings.push(Vec::new()),
-              "gml:posList" => gmlpos = true,
-              "gml:pos" => gmlpos = true,
-              _ => if !settings.hush_warning { eprintln!("Warning: GML type {} not supported", tag); }
-            }
+  let mut loops;
+  'main: loop { // Main loop over the XML nodes
+    let event = reader.read_event(&mut buf);
+    loops = 0;
+    'restart: loop { // Restart loop to be able to process a node twice
+      loops += 1;
+      match event {
+        Ok(Event::Start(ref e)) => {
+          if loops == 1 {
+            path.push('/');
+            path.push_str(reader.decode(e.name()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name()), err)));
           }
-          for res in e.attributes() {
-            match res {
+          if filtered || skipped { break; }
+          if path == settings.skip {
+            skipped = true;
+            break;
+          }
+          else if xmltotext {
+            text.push_str(&format!("<{}>", &e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name()), err))));
+            break;
+          }
+          else if gmltoewkb {
+            match reader.decode(e.name()) {
               Err(_) => (),
-              Ok(attr) => {
-                let key = reader.decode(attr.key);
-                match key {
-                  Ok("srsName") => {
-                    let mut value = String::from(reader.decode(&attr.value).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute '{}': {}", String::from_utf8_lossy(&attr.value), err)));
-                    if let Some(i) = value.rfind("::") {
-                      value = value.split_off(i+2);
-                    }
-                    match value.parse::<u32>() {
-                      Ok(int) => {
-                        if let Some(geom) = gmlcoll.last_mut() { geom.srid = int };
-                      },
-                      Err(_) => if !settings.hush_warning { eprintln!("Warning: invalid srsName {} in GML", value); }
-                    }
-                  },
-                  Ok("srsDimension") => {
-                    let value = reader.decode(&attr.value).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute '{}': {}", String::from_utf8_lossy(&attr.value), err));
-                    match value.parse::<u8>() {
-                      Ok(int) => {
-                        if let Some(geom) = gmlcoll.last_mut() { geom.dims = int };
-                      },
-                      Err(_) => if !settings.hush_warning { eprintln!("Warning: invalid srsDimension {} in GML", value); }
-                    }
-                  }
-                  _ => ()
-                }
+              Ok(tag) => match tag {
+                "gml:Point" => {
+                  gmlcoll.push(Geometry::new(1));
+                  gmlcoll.last_mut().unwrap().rings.push(Vec::new());
+                },
+                "gml:LineString" => gmlcoll.push(Geometry::new(2)),
+                "gml:Polygon" => gmlcoll.push(Geometry::new(3)),
+                "gml:MultiPolygon" => (),
+                "gml:polygonMember" => (),
+                "gml:exterior" => (),
+                "gml:interior" => (),
+                "gml:LinearRing" => gmlcoll.last_mut().unwrap().rings.push(Vec::new()),
+                "gml:posList" => gmlpos = true,
+                "gml:pos" => gmlpos = true,
+                _ => if !settings.hush_warning { eprintln!("Warning: GML type {} not supported", tag); }
               }
             }
-          }
-          continue;
-        }
-        else if path.len() >= table.path.len() {
-          if path == table.path { fullcount += 1; }
-
-          for i in 0..table.columns.len() {
-            if path == table.columns[i].path { // This start tag matches one of the defined columns
-
-              // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
-              if table.columns[i].subtable.is_some() {
-                tables.push(table);
-                table = table.columns[i].subtable.as_ref().unwrap();
-                break;
-              }
-
-              // Handle the 'attr' case where the content is read from an attribute of this tag
-              if let Some(request) = table.columns[i].attr {
-                for res in e.attributes() {
-                  if let Ok(attr) = res {
-                    if let Ok(key) = reader.decode(attr.key) {
-                      if key == request {
-                        if let Ok(value) = reader.decode(&attr.value) {
-                          if !table.columns[i].value.borrow().is_empty() && !allow_iteration(&table.columns[i], &settings) { break; }
-                          table.columns[i].value.borrow_mut().push_str(value)
-                        }
-                        else if !settings.hush_warning { eprintln!("Warning: failed to decode attribute {} for column {}", request, table.columns[i].name); }
-                        break;
+            for res in e.attributes() {
+              match res {
+                Err(_) => (),
+                Ok(attr) => {
+                  let key = reader.decode(attr.key);
+                  match key {
+                    Ok("srsName") => {
+                      let mut value = String::from(reader.decode(&attr.value).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute '{}': {}", String::from_utf8_lossy(&attr.value), err)));
+                      if let Some(i) = value.rfind("::") {
+                        value = value.split_off(i+2);
+                      }
+                      match value.parse::<u32>() {
+                        Ok(int) => {
+                          if let Some(geom) = gmlcoll.last_mut() { geom.srid = int };
+                        },
+                        Err(_) => if !settings.hush_warning { eprintln!("Warning: invalid srsName {} in GML", value); }
+                      }
+                    },
+                    Ok("srsDimension") => {
+                      let value = reader.decode(&attr.value).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute '{}': {}", String::from_utf8_lossy(&attr.value), err));
+                      match value.parse::<u8>() {
+                        Ok(int) => {
+                          if let Some(geom) = gmlcoll.last_mut() { geom.dims = int };
+                        },
+                        Err(_) => if !settings.hush_warning { eprintln!("Warning: invalid srsDimension {} in GML", value); }
                       }
                     }
-                    else if !settings.hush_warning { eprintln!("Warning: failed to decode an attribute for column {}", table.columns[i].name); }
-                  }
-                  else if !settings.hush_warning { eprintln!("Warning: failed to read attributes for column {}", table.columns[i].name); }
-                }
-                if table.columns[i].value.borrow().is_empty() && !settings.hush_warning {
-                  eprintln!("Warning: column {} requested attribute {} not found", table.columns[i].name, request);
-                }
-                if let Some(re) = &table.columns[i].include {
-                  if !re.is_match(&table.columns[i].value.borrow()) {
-                    filtered = true;
-                    table.clear_columns();
+                    _ => ()
                   }
                 }
-                if let Some(re) = &table.columns[i].exclude {
-                  if re.is_match(&table.columns[i].value.borrow()) {
-                    filtered = true;
-                    table.clear_columns();
-                  }
-                }
-              }
-
-              // Set the appropriate convert flag for the following data in case the 'conv' option is present
-              match table.columns[i].convert {
-                None => (),
-                Some("xml-to-text") => xmltotext = true,
-                Some("gml-to-ewkb") => gmltoewkb = true,
-                Some(_) => (),
-              }
-              break;
-            }
-          }
-        }
-      },
-      Ok(Event::Text(ref e)) => {
-        if filtered || skipped { continue; }
-        if xmltotext {
-          text.push_str(&e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)));
-          continue;
-        }
-        else if gmltoewkb {
-          if gmlpos {
-            let value = String::from(&e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML gmlpos '{}': {}", String::from_utf8_lossy(e), err)));
-            for pos in value.split(' ') {
-              gmlcoll.last_mut().unwrap().rings.last_mut().unwrap().push(fast_float::parse(pos).unwrap_or_else(|err| fatalerr!("Error: failed to parse GML pos '{}' into float: {}", pos, err)));
-            }
-          }
-          continue;
-        }
-        for i in 0..table.columns.len() {
-          if path == table.columns[i].path {
-            if table.columns[i].attr.is_some() { break; }
-            if !table.columns[i].value.borrow().is_empty() && !allow_iteration(&table.columns[i], &settings) { break; }
-
-            let unescaped = e.unescaped().unwrap_or_else(|err| fatalerr!("Error: failed to unescape XML text node '{}': {}", String::from_utf8_lossy(e), err));
-            let decoded = reader.decode(&unescaped).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err));
-            if table.columns[i].trim {
-              let trimmed = trimre.replace_all(decoded, " ");
-              table.columns[i].value.borrow_mut().push_str(&trimmed.cow_replace("\\", "\\\\").cow_replace("\t", "\\t"));
-            }
-            else {
-              table.columns[i].value.borrow_mut().push_str(&decoded.cow_replace("\\", "\\\\").cow_replace("\r", "\\r").cow_replace("\n", "\\n").cow_replace("\t", "\\t"));
-            }
-            if let Some(re) = &table.columns[i].include {
-              if !re.is_match(&table.columns[i].value.borrow()) {
-                filtered = true;
-                table.clear_columns();
-              }
-            }
-            if let Some(re) = &table.columns[i].exclude {
-              if re.is_match(&table.columns[i].value.borrow()) {
-                filtered = true;
-                table.clear_columns();
               }
             }
             break;
           }
-        }
-      },
-      Ok(Event::End(_)) => {
-        if path == table.path { // This is an end tag of the row path
-          if filtered {
-            filtered = false;
-            filtercount += 1;
-          }
-          else {
+          else if path.len() >= table.path.len() {
+            if path == maintable.path { fullcount += 1; }
 
-            if !tables.is_empty() { // This is a subtable; write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
-              table.write(&tables.last().unwrap().columns[0].value.borrow());
-              table.write("\t");
-            }
-
-            // Now write out the other column values
             for i in 0..table.columns.len() {
-              if table.columns[i].subtable.is_some() { continue; }
-              if table.columns[i].hide {
-                table.columns[i].value.borrow_mut().clear();
-                continue;
-              }
-              if i > 0 { table.write("\t"); }
-              if table.columns[i].value.borrow().is_empty() { table.write("\\N"); }
-              else {
-                if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
-                  let mut value = table.columns[i].value.borrow_mut();
-                  *value = value.replace(s, r);
+              if path == table.columns[i].path { // This start tag matches one of the defined columns
+
+                // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
+                if table.columns[i].subtable.is_some() {
+                  tables.push(table);
+                  table = table.columns[i].subtable.as_ref().unwrap();
+                  continue 'restart; // Continue the restart loop because a subtable column may also match the current path
                 }
-                table.write(&table.columns[i].value.borrow());
-                table.columns[i].value.borrow_mut().clear();
+
+                // Handle the 'attr' case where the content is read from an attribute of this tag
+                if let Some(request) = table.columns[i].attr {
+                  for res in e.attributes() {
+                    if let Ok(attr) = res {
+                      if let Ok(key) = reader.decode(attr.key) {
+                        if key == request {
+                          if let Ok(value) = reader.decode(&attr.value) {
+                            if !table.columns[i].value.borrow().is_empty() && !allow_iteration(&table.columns[i], &settings) { break; }
+                            table.columns[i].value.borrow_mut().push_str(value)
+                          }
+                          else if !settings.hush_warning { eprintln!("Warning: failed to decode attribute {} for column {}", request, table.columns[i].name); }
+                          break;
+                        }
+                      }
+                      else if !settings.hush_warning { eprintln!("Warning: failed to decode an attribute for column {}", table.columns[i].name); }
+                    }
+                    else if !settings.hush_warning { eprintln!("Warning: failed to read attributes for column {}", table.columns[i].name); }
+                  }
+                  if table.columns[i].value.borrow().is_empty() && !settings.hush_warning {
+                    eprintln!("Warning: column {} requested attribute {} not found", table.columns[i].name, request);
+                  }
+                  if let Some(re) = &table.columns[i].include {
+                    if !re.is_match(&table.columns[i].value.borrow()) {
+                      filtered = true;
+                      table.clear_columns();
+                    }
+                  }
+                  if let Some(re) = &table.columns[i].exclude {
+                    if re.is_match(&table.columns[i].value.borrow()) {
+                      filtered = true;
+                      table.clear_columns();
+                    }
+                  }
+                }
+
+                // Set the appropriate convert flag for the following data in case the 'conv' option is present
+                match table.columns[i].convert {
+                  None => (),
+                  Some("xml-to-text") => xmltotext = true,
+                  Some("gml-to-ewkb") => gmltoewkb = true,
+                  Some(_) => (),
+                }
+                break;
               }
             }
-            table.write("\n");
-            if !tables.is_empty() { table = tables.pop().unwrap(); }
           }
-        }
-        else if skipped && path == settings.skip {
-          skipped = false;
-          skipcount += 1;
-        }
-        let i = path.rfind('/').unwrap();
-        let tag = path.split_off(i);
-        if xmltotext {
-          text.push_str(&format!("<{}>", tag));
+        },
+        Ok(Event::Text(ref e)) => {
+          if filtered || skipped { break; }
+          if xmltotext {
+            text.push_str(&e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)));
+            break;
+          }
+          else if gmltoewkb {
+            if gmlpos {
+              let value = String::from(&e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML gmlpos '{}': {}", String::from_utf8_lossy(e), err)));
+              for pos in value.split(' ') {
+                gmlcoll.last_mut().unwrap().rings.last_mut().unwrap().push(fast_float::parse(pos).unwrap_or_else(|err| fatalerr!("Error: failed to parse GML pos '{}' into float: {}", pos, err)));
+              }
+            }
+            break;
+          }
           for i in 0..table.columns.len() {
             if path == table.columns[i].path {
-              xmltotext = false;
-              if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
-                text = text.replace(s, r);
+              if table.columns[i].attr.is_some() { break; }
+              if !table.columns[i].value.borrow().is_empty() && !allow_iteration(&table.columns[i], &settings) { break; }
+
+              let unescaped = e.unescaped().unwrap_or_else(|err| fatalerr!("Error: failed to unescape XML text node '{}': {}", String::from_utf8_lossy(e), err));
+              let decoded = reader.decode(&unescaped).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err));
+              if table.columns[i].trim {
+                let trimmed = trimre.replace_all(decoded, " ");
+                table.columns[i].value.borrow_mut().push_str(&trimmed.cow_replace("\\", "\\\\").cow_replace("\t", "\\t"));
               }
-              table.columns[i].value.borrow_mut().push_str(&text);
-              text.clear();
+              else {
+                table.columns[i].value.borrow_mut().push_str(&decoded.cow_replace("\\", "\\\\").cow_replace("\r", "\\r").cow_replace("\n", "\\n").cow_replace("\t", "\\t"));
+              }
+              if let Some(re) = &table.columns[i].include {
+                if !re.is_match(&table.columns[i].value.borrow()) {
+                  filtered = true;
+                  table.clear_columns();
+                }
+              }
+              if let Some(re) = &table.columns[i].exclude {
+                if re.is_match(&table.columns[i].value.borrow()) {
+                  filtered = true;
+                  table.clear_columns();
+                }
+              }
               break;
             }
           }
-        }
-        else if gmltoewkb {
-          if gmlpos && ((tag == "/gml:pos") || (tag == "/gml:posList")) { gmlpos = false; }
-          for i in 0..table.columns.len() {
-            if path == table.columns[i].path {
-              gmltoewkb = false;
-              if !gml_to_ewkb(&table.columns[i].value, &gmlcoll, table.columns[i].bbox.as_ref(), table.columns[i].multitype, &settings) {
-                filtered = true;
-                table.clear_columns();
+        },
+        Ok(Event::End(_)) => {
+          if path == table.path { // This is an end tag of the row path
+            if filtered {
+              filtered = false;
+              filtercount += 1;
+            }
+            else {
+
+              if !tables.is_empty() { // This is a subtable; write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
+                table.write(&tables.last().unwrap().columns[0].value.borrow());
+                table.write("\t");
               }
-              gmlcoll.clear();
-              break;
+
+              // Now write out the other column values
+              for i in 0..table.columns.len() {
+                if table.columns[i].subtable.is_some() { continue; }
+                if table.columns[i].hide {
+                  table.columns[i].value.borrow_mut().clear();
+                  continue;
+                }
+                if i > 0 { table.write("\t"); }
+                if table.columns[i].value.borrow().is_empty() { table.write("\\N"); }
+                else {
+                  if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
+                    let mut value = table.columns[i].value.borrow_mut();
+                    *value = value.replace(s, r);
+                  }
+                  table.write(&table.columns[i].value.borrow());
+                  table.columns[i].value.borrow_mut().clear();
+                }
+              }
+              table.write("\n");
+              if !tables.is_empty() {
+                table = tables.pop().unwrap();
+                continue 'restart;
+              }
             }
           }
-        }
-      },
-      Ok(Event::Eof) => break,
-      Err(e) => fatalerr!("Error: failed to parse XML at position {}: {}", reader.buffer_position(), e),
-      _ => ()
+          else if skipped && path == settings.skip {
+            skipped = false;
+            skipcount += 1;
+          }
+          let i = path.rfind('/').unwrap();
+          let tag = path.split_off(i);
+          if xmltotext {
+            text.push_str(&format!("<{}>", tag));
+            for i in 0..table.columns.len() {
+              if path == table.columns[i].path {
+                xmltotext = false;
+                if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
+                  text = text.replace(s, r);
+                }
+                table.columns[i].value.borrow_mut().push_str(&text);
+                text.clear();
+                break;
+              }
+            }
+          }
+          else if gmltoewkb {
+            if gmlpos && ((tag == "/gml:pos") || (tag == "/gml:posList")) { gmlpos = false; }
+            for i in 0..table.columns.len() {
+              if path == table.columns[i].path {
+                gmltoewkb = false;
+                if !gml_to_ewkb(&table.columns[i].value, &gmlcoll, table.columns[i].bbox.as_ref(), table.columns[i].multitype, &settings) {
+                  filtered = true;
+                  table.clear_columns();
+                }
+                gmlcoll.clear();
+                break;
+              }
+            }
+          }
+        },
+        Ok(Event::Eof) => break 'main,
+        Err(e) => fatalerr!("Error: failed to parse XML at position {}: {}", reader.buffer_position(), e),
+        _ => ()
+      }
+      break; // By default we break out of the restart loop
     }
     buf.clear();
   }
