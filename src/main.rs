@@ -96,7 +96,7 @@ struct Column<'a> {
   convert: Option<&'a str>,
   find: Option<&'a str>,
   replace: Option<&'a str>,
-  consol: Option<&'a str>,
+  aggr: Option<&'a str>,
   subtable: Option<Table<'a>>,
   bbox: Option<BBox>,
   multitype: bool
@@ -239,7 +239,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     let convert = col["conv"].as_str();
     let find = col["find"].as_str();
     let replace = col["repl"].as_str();
-    let consol = col["cons"].as_str();
+    let aggr = col["aggr"].as_str();
     let bbox = col["bbox"].as_str().and_then(BBox::from);
     let multitype = col["mult"].as_bool().unwrap_or(false);
 
@@ -258,15 +258,15 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       if find.is_some() && !settings.hush_notice {
         eprintln!("Notice: when using filtering (incl/excl) and find/replace on a single column, the filter is checked before replacements");
       }
-      if consol.is_some() && !settings.hush_notice {
-        eprintln!("Notice: when using filtering (incl/excl) and consolidation on a single column, the filter is checked at each phase of consolidation separately");
+      if aggr.is_some() && !settings.hush_notice {
+        eprintln!("Notice: when using filtering (incl/excl) and aggregation on a single column, the filter is checked at each step of aggregation separately");
       }
     }
     if bbox.is_some() && (convert.is_none() || convert.unwrap() != "gml-to-ewkb") && !settings.hush_warning {
       eprintln!("Warning: the bbox option has no function without conversion type 'gml-to-ekwb'");
     }
 
-    let column = Column { name: colname.to_string(), path, datatype, value: RefCell::new(String::new()), attr, hide, include, exclude, trim, convert, find, replace, consol, subtable, bbox, multitype };
+    let column = Column { name: colname.to_string(), path, datatype, value: RefCell::new(String::new()), attr, hide, include, exclude, trim, convert, find, replace, aggr, subtable, bbox, multitype };
     table.columns.push(column);
   }
 
@@ -641,10 +641,10 @@ fn main() {
 }
 
 fn allow_iteration(column: &Column, settings: &Settings) -> bool {
-  match column.consol {
+  match column.aggr {
     None if settings.hush_warning => false,
     None => {
-      eprintln!("Warning: column '{}' has multiple occurrences without a consolidation method; using 'first'", column.name);
+      eprintln!("Warning: column '{}' has multiple occurrences without an aggregation method; using 'first'", column.name);
       false
     },
     Some("first") => false,
