@@ -445,6 +445,7 @@ fn main() {
                     if let Ok(key) = reader.decode(attr.key) {
                       if key == request {
                         if let Ok(value) = reader.decode(&attr.value) {
+                          if !table.columns[i].value.borrow().is_empty() && !allow_iteration(&table.columns[i], &settings) { break; }
                           table.columns[i].value.borrow_mut().push_str(value)
                         }
                         else if !settings.hush_warning { eprintln!("Warning: failed to decode attribute {} for column {}", request, table.columns[i].name); }
@@ -502,24 +503,8 @@ fn main() {
         for i in 0..table.columns.len() {
           if path == table.columns[i].path {
             if table.columns[i].attr.is_some() { break; }
-            match table.columns[i].consol {
-              None => {
-                if !table.columns[i].value.borrow().is_empty() && !settings.hush_warning {
-                  eprintln!("Warning: column '{}' has multiple occurrences without a consolidation method; using 'first'", table.columns[i].name);
-                  break;
-                }
-              },
-              Some("first") => {
-                break;
-              },
-              Some("append") => {
-                if !table.columns[i].value.borrow().is_empty() { table.columns[i].value.borrow_mut().push(','); }
-              },
-              Some(s) => {
-                if !settings.hush_warning { eprintln!("Warning: column '{}' has invalid consolidation method {}", table.columns[i].name, s); }
-                break;
-              }
-            }
+            if !table.columns[i].value.borrow().is_empty() && !allow_iteration(&table.columns[i], &settings) { break; }
+
             let unescaped = e.unescaped().unwrap_or_else(|err| fatalerr!("Error: failed to unescape XML text node '{}': {}", String::from_utf8_lossy(e), err));
             let decoded = reader.decode(&unescaped).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err));
             if table.columns[i].trim {
@@ -629,5 +614,21 @@ fn main() {
       match filtercount { 0 => "".to_owned(), n => format!(" ({} excluded)", n) },
       match skipcount { 0 => "".to_owned(), n => format!(" ({} skipped)", n) }
     );
+  }
+}
+
+fn allow_iteration(column: &Column, settings: &Settings) -> bool {
+  match column.consol {
+    None if settings.hush_warning => false,
+    None => {
+      eprintln!("Warning: column '{}' has multiple occurrences without a consolidation method; using 'first'", column.name);
+      false
+    },
+    Some("first") => false,
+    Some("append") => {
+      if !column.value.borrow().is_empty() { column.value.borrow_mut().push(','); }
+      true
+    },
+    _ => true
   }
 }
