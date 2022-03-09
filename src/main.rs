@@ -553,7 +553,9 @@ fn main() {
           for i in 0..table.columns.len() {
             if path == table.columns[i].path {
               if table.columns[i].attr.is_some() { break; }
-              if !table.columns[i].value.borrow().is_empty() && !allow_iteration(&table.columns[i], &settings) { break; }
+              if !table.columns[i].value.borrow().is_empty() {
+                if !allow_iteration(&table.columns[i], &settings) { break; }
+              }
 
               let unescaped = e.unescaped().unwrap_or_else(|err| fatalerr!("Error: failed to unescape XML text node '{}': {}", String::from_utf8_lossy(e), err));
               let decoded = reader.decode(&unescaped).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err));
@@ -610,7 +612,7 @@ fn main() {
                       domain.lastid += 1;
                       let id = domain.lastid;
                       domain.map.insert(table.columns[i].value.borrow().to_string(), id);
-                      domain.table.write(&format!("{}\t{}\n", id, table.columns[i].value.borrow()));
+                      domain.table.write(&format!("{}\t{}\n", id, *table.columns[i].value.borrow()));
                       id
                     }
                   };
