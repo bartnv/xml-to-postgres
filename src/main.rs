@@ -314,7 +314,7 @@ fn emit_preamble(table: &Table, settings: &Settings, fkey: Option<String>) {
   }
   if settings.emit_createtable {
     let mut cols = table.columns.iter().filter_map(|c| {
-      if c.subtable.is_some() { return None; }
+      if c.hide || c.subtable.is_some() { return None; }
       let mut spec = String::from(&c.name);
       spec.push(' ');
       spec.push_str(&c.datatype);
@@ -327,7 +327,10 @@ fn emit_preamble(table: &Table, settings: &Settings, fkey: Option<String>) {
     table.write(&format!("TRUNCATE {};\n", table.name));
   }
   if settings.emit_copyfrom {
-    let cols = table.columns.iter().filter_map(|c| match c.subtable { None=> Some(String::from(&c.name)), Some(_) => None }).collect::<Vec<String>>().join(", ");
+    let cols = table.columns.iter().filter_map(|c| {
+      if c.hide || c.subtable.is_some() { return None; }
+      Some(String::from(&c.name))
+    }).collect::<Vec<String>>().join(", ");
     if fkey.is_some() {
       table.write(&format!("COPY {} ({}, {}) FROM stdin;\n", table.name, fkey.unwrap().split(' ').next().unwrap(), cols));
     }
