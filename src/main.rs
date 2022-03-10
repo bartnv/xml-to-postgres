@@ -524,6 +524,10 @@ fn main() {
                       table.clear_columns();
                     }
                   }
+                  if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
+                    let mut value = table.columns[i].value.borrow_mut();
+                    *value = value.replace(s, r);
+                  }
                 }
 
                 // Set the appropriate convert flag for the following data in case the 'conv' option is present
@@ -573,13 +577,19 @@ fn main() {
                 if !re.is_match(&table.columns[i].value.borrow()) {
                   filtered = true;
                   table.clear_columns();
+                  break;
                 }
               }
               if let Some(re) = &table.columns[i].exclude {
                 if re.is_match(&table.columns[i].value.borrow()) {
                   filtered = true;
                   table.clear_columns();
+                  break;
                 }
+              }
+              if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
+                let mut value = table.columns[i].value.borrow_mut();
+                *value = value.replace(s, r);
               }
               break;
             }
@@ -623,10 +633,6 @@ fn main() {
                   table.columns[i].value.borrow_mut().clear();
                 }
                 else {
-                  if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
-                    let mut value = table.columns[i].value.borrow_mut();
-                    *value = value.replace(s, r);
-                  }
                   table.write(&table.columns[i].value.borrow());
                   table.columns[i].value.borrow_mut().clear();
                 }
