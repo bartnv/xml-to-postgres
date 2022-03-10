@@ -259,10 +259,10 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     let find = col["find"].as_str();
     let replace = col["repl"].as_str();
     let aggr = col["aggr"].as_str();
-    let norm = col["norm"].as_bool().unwrap_or(false);
+    let norm = col["norm"].as_str();
     let domain = match norm {
-      true => {
-        let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: option 'norm' requires a 'file' entry"));
+      Some(filename) => {
+        if filename == "true" { fatalerr!("Error: 'norm' option now takes a file path instead of a boolean"); }
         let mut domain = Domain::new(colname, colpath, filename, settings);
         domain.table.columns.push(Column { name: String::from("id"), path: String::new(), datatype: String::from("integer"), ..Default::default()});
         domain.table.columns.push(Column { name: String::from("value"), path: String::new(), datatype, ..Default::default()});
@@ -270,7 +270,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
         datatype = String::from("integer");
         Some(RefCell::new(domain))
       },
-      false => None
+      None => None
     };
     let bbox = col["bbox"].as_str().and_then(BBox::from);
     let multitype = col["mult"].as_bool().unwrap_or(false);
