@@ -43,6 +43,7 @@ struct Table<'a> {
   path: String,
   file: RefCell<Box<dyn Write>>,
   columns: Vec<Column<'a>>,
+  domain: Box<Option<RefCell<Domain<'a>>>>,
   emit_copyfrom: bool,
   emit_starttransaction: bool
 }
@@ -65,6 +66,7 @@ impl<'a> Table<'a> {
         ))
       },
       columns: Vec::new(),
+      domain: Box::new(None),
       emit_copyfrom: settings.emit_copyfrom,
       emit_starttransaction: settings.emit_starttransaction
     }
@@ -243,7 +245,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     path.push_str(colpath);
     if path.ends_with('/') { path.pop(); }
     let mut datatype = col["type"].as_str().unwrap_or("text").to_string();
-    let subtable: Option<Table> = match col["cols"].is_badvalue() {
+    let mut subtable: Option<Table> = match col["cols"].is_badvalue() {
       true => None,
       false => {
         let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable has no 'file' entry"));
@@ -268,7 +270,11 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
         domain.table.columns.push(Column { name: String::from("value"), path: String::new(), datatype, ..Default::default()});
         emit_preamble(&domain.table, settings, None);
         datatype = String::from("integer");
-        Some(RefCell::new(domain))
+        if let Some(ref mut table) = subtable { // Push the domain down to the subtable
+          table.domain = Box::new(Some(RefCell::new(domain)));
+          None
+        }
+        else { Some(RefCell::new(domain)) }
       },
       None => None
     };
@@ -605,7 +611,51 @@ fn main() {
 
               if !tables.is_empty() { // This is a subtable; write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
                 table.write(&tables.last().unwrap().columns[0].value.borrow());
-                table.write("\t");
+                if let Some(domain) = table.domain.as_ref() {
+                  let mut domain = domain.borrow_mut();
+                  let found = match domain.map.get(&table.columns[0].value.borrow().to_string()) {
+                    Some(id) => { table.write(&format!("\t{}\n" , *id)); true },
+                    None => {
+                      domain.lastid += 1;
+                      let id = domain.lastid;
+                      table.write(&format!("\t{}\n" , id));
+                      domain.map.insert(table.columns[0].value.borrow().to_string(), id);
+                      domain.table.write(&format!("{}\t", id));
+                      false
+                    }
+                  };
+
+                  if !found {
+                    for i in 0..table.columns.len() {
+                      if table.columns[i].subtable.is_some() { continue; }
+                      if table.columns[i].hide { continue; }
+                      if i > 0 { domain.table.write("\t"); }
+                      if table.columns[i].value.borrow().is_empty() { domain.table.write("\\N"); }
+                      else if let Some(domain) = table.columns[i].domain.as_ref() {
+                        let mut domain = domain.borrow_mut();
+                        let id = match domain.map.get(&table.columns[i].value.borrow().to_string()) {
+                          Some(id) => *id,
+                          None => {
+                            domain.lastid += 1;
+                            let id = domain.lastid;
+                            domain.map.insert(table.columns[i].value.borrow().to_string(), id);
+                            domain.table.write(&format!("{}\t{}\n", id, *table.columns[i].value.borrow()));
+                            id
+                          }
+                        };
+                        domain.table.write(&format!("{}", id));
+                      }
+                      else {
+                        domain.table.write(&table.columns[i].value.borrow());
+                      }
+                    }
+                    domain.table.write("\n");
+                  }
+                  table.clear_columns();
+                  table = tables.pop().unwrap();
+                  continue 'restart;
+                }
+                else { table.write("\t"); }
               }
 
               // Now write out the other column values
