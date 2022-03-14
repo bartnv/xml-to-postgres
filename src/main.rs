@@ -259,6 +259,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     let mut subtable: Option<Table> = match col["cols"].is_badvalue() {
       true => None,
       false => {
+        if table.columns.is_empty() { fatalerr!("Error: table '{}' cannot have a subtable as first column", name); }
         let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable {} has no 'file' entry", colname));
         Some(add_table(colname, &path, Some(filename), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), Some(format!("{} {}", name, table.columns[0].datatype))))
       }
@@ -294,10 +295,15 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
 
     if let Some(val) = convert {
       if !vec!("xml-to-text", "gml-to-ewkb").contains(&val) {
-        fatalerr!("Error: option 'convert' contains invalid value: {}", val);
+        fatalerr!("Error: table '{}' option 'conv' contains invalid value: {}", name, val);
       }
       if val == "gml-to-ewkb" && !settings.hush_notice {
         eprintln!("Notice: gml-to-ewkb conversion is experimental and in no way complete or standards compliant; use at your own risk");
+      }
+    }
+    if let Some(val) = aggr {
+      if !vec!("first", "last", "append").contains(&val) {
+        fatalerr!("Error: table '{}' option 'aggr' contains invalid value: {}", name, val);
       }
     }
     if include.is_some() || exclude.is_some() {
@@ -523,7 +529,10 @@ fn main() {
                       if let Ok(key) = reader.decode(attr.key) {
                         if key == request {
                           if let Ok(value) = reader.decode(&attr.value) {
-                            if !table.columns[i].value.borrow().is_empty() && !allow_iteration(&table.columns[i], &settings) { break; }
+                            if !table.columns[i].value.borrow().is_empty() {
+                              if !allow_iteration(&table.columns[i], &settings) { break; }
+                              if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
+                            }
                             table.columns[i].value.borrow_mut().push_str(value)
                           }
                           else if !settings.hush_warning { eprintln!("Warning: failed to decode attribute {} for column {}", request, table.columns[i].name); }
@@ -587,6 +596,7 @@ fn main() {
               if table.columns[i].attr.is_some() || table.columns[i].serial.is_some() { break; }
               if !table.columns[i].value.borrow().is_empty() {
                 if !allow_iteration(&table.columns[i], &settings) { break; }
+                if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
               }
 
               let unescaped = e.unescaped().unwrap_or_else(|err| fatalerr!("Error: failed to unescape XML text node '{}': {}", String::from_utf8_lossy(e), err));
@@ -766,6 +776,7 @@ fn allow_iteration(column: &Column, settings: &Settings) -> bool {
       false
     },
     Some("first") => false,
+    Some("last") => true,
     Some("append") => {
       if !column.value.borrow().is_empty() { column.value.borrow_mut().push(','); }
       true
