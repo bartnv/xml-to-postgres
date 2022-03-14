@@ -631,22 +631,12 @@ fn main() {
               if !tables.is_empty() { // This is a subtable; write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
                 let key = tables.last().unwrap().columns[0].value.borrow();
                 if key.is_empty() && !settings.hush_warning { println!("Warning: subtable {} has no foreign key for parent (you may need to add a 'seri' column)", table.name); }
-                table.write(&key);
+                table.write(&format!("{}\t", key));
                 if let Some(domain) = table.domain.as_ref() {
+                  table.write(&format!("{}\n" , table.columns[0].value.borrow())); // This is a many-to-may relation; write the two keys into the link table
                   let mut domain = domain.borrow_mut();
-                  let found = match domain.map.get(&table.columns[0].value.borrow().to_string()) {
-                    Some(id) => { table.write(&format!("\t{}\n" , *id)); true },
-                    None => {
-                      domain.lastid += 1;
-                      let id = domain.lastid;
-                      table.write(&format!("\t{}\n" , id));
-                      domain.map.insert(table.columns[0].value.borrow().to_string(), id);
-                      domain.table.write(&format!("{}\t", id));
-                      false
-                    }
-                  };
-
-                  if !found {
+                  if !domain.map.contains_key(&table.columns[0].value.borrow().to_string()) {
+                    domain.map.insert(table.columns[0].value.borrow().to_string(), 0); // Table domains use the HashMap as a HashSet
                     for i in 0..table.columns.len() {
                       if table.columns[i].subtable.is_some() { continue; }
                       if table.columns[i].hide { continue; }
@@ -676,7 +666,6 @@ fn main() {
                   table = tables.pop().unwrap();
                   continue 'restart;
                 }
-                else { table.write("\t"); }
               }
 
               // Now write out the other column values
