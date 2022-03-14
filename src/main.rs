@@ -2,7 +2,7 @@ use std::io::{Read, Write, BufReader, BufRead, stdin, stdout};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::env;
-use std::cell::RefCell;
+use std::cell::{ Cell, RefCell };
 use std::time::Instant;
 use std::default::Default;
 use std::collections::HashMap;
@@ -106,6 +106,7 @@ impl<'a> Domain<'a> {
 struct Column<'a> {
   name: String,
   path: String,
+  serial: Option<Cell<u64>>,
   datatype: String,
   value: RefCell<String>,
   attr: Option<&'a str>,
@@ -239,11 +240,21 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
   let mut table = Table::new(name, rowpath, outfile, settings);
   for col in colspec {
     let colname = col["name"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'name' entry in configuration file"));
-    let colpath = col["path"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'path' entry in configuration file"));
+    let colpath = match col["seri"].as_bool() {
+      Some(true) => "/",
+      _ => col["path"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'path' entry in configuration file"))
+    };
     let mut path = String::from(&table.path);
     if !colpath.is_empty() && !colpath.starts_with('/') { path.push('/'); }
     path.push_str(colpath);
     if path.ends_with('/') { path.pop(); }
+    let serial = match col["seri"].as_bool() {
+      Some(true) => {
+        if *col != colspec[0] { eprintln!("Notice: a 'seri' column usually needs to be the first column; {} in table {} is not", colname, table.name); }
+        Some(Cell::new(0))
+      },
+      _ => None
+    };
     let mut datatype = col["type"].as_str().unwrap_or("text").to_string();
     let mut subtable: Option<Table> = match col["cols"].is_badvalue() {
       true => None,
@@ -304,7 +315,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       eprintln!("Warning: the bbox option has no function without conversion type 'gml-to-ekwb'");
     }
 
-    let column = Column { name: colname.to_string(), path, datatype, value: RefCell::new(String::new()), attr, hide, include, exclude, trim, convert, find, replace, aggr, subtable, domain, bbox, multitype };
+    let column = Column { name: colname.to_string(), path, serial, datatype, value: RefCell::new(String::new()), attr, hide, include, exclude, trim, convert, find, replace, aggr, subtable, domain, bbox, multitype };
     table.columns.push(column);
   }
 
@@ -490,6 +501,14 @@ fn main() {
             for i in 0..table.columns.len() {
               if path == table.columns[i].path { // This start tag matches one of the defined columns
 
+                // Handle the 'seri' case where this column is a virtual auto-incrementing serial
+                if let Some(ref serial) = table.columns[i].serial {
+                  let id = serial.get();
+                  table.columns[i].value.borrow_mut().push_str(&id.to_string());
+                  serial.set(id+1);
+                  continue;
+                }
+
                 // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
                 if table.columns[i].subtable.is_some() {
                   tables.push(table);
@@ -565,7 +584,7 @@ fn main() {
           }
           for i in 0..table.columns.len() {
             if path == table.columns[i].path {
-              if table.columns[i].attr.is_some() { break; }
+              if table.columns[i].attr.is_some() || table.columns[i].serial.is_some() { break; }
               if !table.columns[i].value.borrow().is_empty() {
                 if !allow_iteration(&table.columns[i], &settings) { break; }
               }
@@ -610,7 +629,9 @@ fn main() {
             else {
 
               if !tables.is_empty() { // This is a subtable; write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
-                table.write(&tables.last().unwrap().columns[0].value.borrow());
+                let key = tables.last().unwrap().columns[0].value.borrow();
+                if key.is_empty() && !settings.hush_warning { println!("Warning: subtable {} has no foreign key for parent (you may need to add a 'seri' column)", table.name); }
+                table.write(&key);
                 if let Some(domain) = table.domain.as_ref() {
                   let mut domain = domain.borrow_mut();
                   let found = match domain.map.get(&table.columns[0].value.borrow().to_string()) {
