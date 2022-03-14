@@ -509,9 +509,9 @@ fn main() {
 
                 // Handle the 'seri' case where this column is a virtual auto-incrementing serial
                 if let Some(ref serial) = table.columns[i].serial {
-                  let id = serial.get();
+                  let id = serial.get()+1;
                   table.columns[i].value.borrow_mut().push_str(&id.to_string());
-                  serial.set(id+1);
+                  serial.set(id);
                   continue;
                 }
 
