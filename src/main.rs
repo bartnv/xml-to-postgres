@@ -259,7 +259,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     let mut subtable: Option<Table> = match col["cols"].is_badvalue() {
       true => None,
       false => {
-        let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable has no 'file' entry"));
+        let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable {} has no 'file' entry", colname));
         Some(add_table(colname, &path, Some(filename), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), Some(format!("{} {}", name, table.columns[0].datatype))))
       }
     };
