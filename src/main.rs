@@ -44,6 +44,7 @@ struct Table<'a> {
   file: RefCell<Box<dyn Write>>,
   columns: Vec<Column<'a>>,
   domain: Box<Option<RefCell<Domain<'a>>>>,
+  normalized: bool,
   emit_copyfrom: bool,
   emit_starttransaction: bool
 }
@@ -67,6 +68,7 @@ impl<'a> Table<'a> {
       },
       columns: Vec::new(),
       domain: Box::new(None),
+      normalized: false,
       emit_copyfrom: settings.emit_copyfrom,
       emit_starttransaction: settings.emit_starttransaction
     }
@@ -93,11 +95,11 @@ struct Domain<'a> {
   table: Table<'a>
 }
 impl<'a> Domain<'a> {
-  fn new(tabname: &str, path: &str, filename: &str, settings: &Settings) -> Domain<'a> {
+  fn new(tabname: &str, path: &str, filename: Option<&str>, settings: &Settings) -> Domain<'a> {
     Domain {
       lastid: 0,
       map: HashMap::new(),
-      table: Table::new(tabname, path, Some(filename), settings)
+      table: Table::new(tabname, path, filename, settings)
     }
   }
 }
@@ -242,7 +244,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     let colname = col["name"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'name' entry in configuration file"));
     let colpath = match col["seri"].as_bool() {
       Some(true) => "/",
-      _ => col["path"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'path' entry in configuration file"))
+      _ => col["path"].as_str().unwrap_or_else(|| fatalerr!("Error: table '{}' column '{}' has no 'path' entry in configuration file", name, colname))
     };
     let mut path = String::from(&table.path);
     if !colpath.is_empty() && !colpath.starts_with('/') { path.push('/'); }
@@ -256,12 +258,20 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       _ => None
     };
     let mut datatype = col["type"].as_str().unwrap_or("text").to_string();
+    let norm = col["norm"].as_str();
     let mut subtable: Option<Table> = match col["cols"].is_badvalue() {
       true => None,
       false => {
-        if table.columns.is_empty() { fatalerr!("Error: table '{}' cannot have a subtable as first column", name); }
-        let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable {} has no 'file' entry", colname));
-        Some(add_table(colname, &path, Some(filename), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), Some(format!("{} {}", name, table.columns[0].datatype))))
+        if norm.is_some() && col["file"].is_badvalue() { // Normalized subtable; writes its primary key into the parent table
+          let mut subtable = add_table(colname, &path, norm, settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), None);
+          subtable.normalized = true;
+          Some(subtable)
+        }
+        else {
+          let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable {} has no 'file' entry", colname));
+          if table.columns.is_empty() { fatalerr!("Error: table '{}' cannot have a subtable as first column", name); }
+          Some(add_table(colname, &path, Some(filename), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), Some(format!("{} {}", name, table.columns[0].datatype))))
+        }
       }
     };
     let hide = col["hide"].as_bool().unwrap_or(false);
@@ -273,11 +283,14 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     let find = col["find"].as_str();
     let replace = col["repl"].as_str();
     let aggr = col["aggr"].as_str();
-    let norm = col["norm"].as_str();
     let domain = match norm {
       Some(filename) => {
         if filename == "true" { fatalerr!("Error: 'norm' option now takes a file path instead of a boolean"); }
-        let mut domain = Domain::new(colname, colpath, filename, settings);
+        let file = match col["file"].is_badvalue() {
+          true => None,           // One-to-many relation
+          false => Some(filename) // Many-to-many relation
+        };
+        let mut domain = Domain::new(colname, colpath, file, settings);
         domain.table.columns.push(Column { name: String::from("id"), path: String::new(), datatype: String::from("integer"), ..Default::default()});
         domain.table.columns.push(Column { name: String::from("value"), path: String::new(), datatype, ..Default::default()});
         emit_preamble(&domain.table, settings, None);
@@ -415,6 +428,7 @@ fn main() {
   }
   let mut tables: Vec<&Table> = Vec::new();
   let mut table = &maintable;
+  let mut parentcol = None;
 
   let mut filtered = false;
   let mut skipped = false;
@@ -518,6 +532,7 @@ fn main() {
                 // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
                 if table.columns[i].subtable.is_some() {
                   tables.push(table);
+                  parentcol = Some(&table.columns[i]);
                   table = table.columns[i].subtable.as_ref().unwrap();
                   continue 'restart; // Continue the restart loop because a subtable column may also match the current path
                 }
@@ -638,49 +653,66 @@ fn main() {
             }
             else {
 
-              if !tables.is_empty() { // This is a subtable; write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
-                let key = tables.last().unwrap().columns[0].value.borrow();
-                if key.is_empty() && !settings.hush_warning { println!("Warning: subtable {} has no foreign key for parent (you may need to add a 'seri' column)", table.name); }
-                table.write(&format!("{}\t", key));
-                if let Some(domain) = table.domain.as_ref() {
-                  table.write(&format!("{}\n" , table.columns[0].value.borrow())); // This is a many-to-may relation; write the two keys into the link table
-                  let mut domain = domain.borrow_mut();
-                  if !domain.map.contains_key(&table.columns[0].value.borrow().to_string()) {
-                    domain.map.insert(table.columns[0].value.borrow().to_string(), 0); // Table domains use the HashMap as a HashSet
-                    for i in 0..table.columns.len() {
-                      if table.columns[i].subtable.is_some() { continue; }
-                      if table.columns[i].hide { continue; }
-                      if i > 0 { domain.table.write("\t"); }
-                      if table.columns[i].value.borrow().is_empty() { domain.table.write("\\N"); }
-                      else if let Some(domain) = table.columns[i].domain.as_ref() {
-                        let mut domain = domain.borrow_mut();
-                        let id = match domain.map.get(&table.columns[i].value.borrow().to_string()) {
-                          Some(id) => *id,
-                          None => {
-                            domain.lastid += 1;
-                            let id = domain.lastid;
-                            domain.map.insert(table.columns[i].value.borrow().to_string(), id);
-                            domain.table.write(&format!("{}\t{}\n", id, *table.columns[i].value.borrow()));
-                            id
-                          }
-                        };
-                        domain.table.write(&format!("{}", id));
+              if !tables.is_empty() { // This is a subtable
+                if !table.normalized { // Write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
+                  let key = tables.last().unwrap().columns[0].value.borrow();
+                  if key.is_empty() && !settings.hush_warning { println!("Warning: subtable {} has no foreign key for parent (you may need to add a 'seri' column)", table.name); }
+                  table.write(&format!("{}\t", key));
+                  if let Some(domain) = table.domain.as_ref() {
+                    if table.columns[0].value.borrow().is_empty() { println!("Warning: subtable {} has no primary key to normalize on", table.name); }
+                    table.write(&format!("{}" , table.columns[0].value.borrow())); // This is a many-to-may relation; write the two keys into the link table
+                    let mut domain = domain.borrow_mut();
+                    if !domain.map.contains_key(&table.columns[0].value.borrow().to_string()) {
+                      domain.map.insert(table.columns[0].value.borrow().to_string(), 0); // Table domains use the HashMap as a HashSet
+                      for i in 0..table.columns.len() {
+                        if table.columns[i].subtable.is_some() { continue; }
+                        if table.columns[i].hide { continue; }
+                        if i > 0 { domain.table.write("\t"); }
+                        if table.columns[i].value.borrow().is_empty() { domain.table.write("\\N"); }
+                        else if let Some(domain) = table.columns[i].domain.as_ref() {
+                          let mut domain = domain.borrow_mut();
+                          let id = match domain.map.get(&table.columns[i].value.borrow().to_string()) {
+                            Some(id) => *id,
+                            None => {
+                              domain.lastid += 1;
+                              let id = domain.lastid;
+                              domain.map.insert(table.columns[i].value.borrow().to_string(), id);
+                              domain.table.write(&format!("{}\t{}\n", id, *table.columns[i].value.borrow()));
+                              id
+                            }
+                          };
+                          domain.table.write(&format!("{}", id));
+                        }
+                        else {
+                          domain.table.write(&table.columns[i].value.borrow());
+                        }
                       }
-                      else {
-                        domain.table.write(&table.columns[i].value.borrow());
-                      }
+                      domain.table.write("\n");
                     }
-                    domain.table.write("\n");
+                    table.write("\n");
+                    table.clear_columns();
+                    table = tables.pop().unwrap();
+                    continue 'restart;
                   }
-                  table.clear_columns();
-                  table = tables.pop().unwrap();
-                  continue 'restart;
+                }
+                else { // Normalized; write the id of this subtable into the parent table
+                  parentcol.unwrap().value.borrow_mut().push_str(&table.columns[0].value.borrow());
+                  if let Some(domain) = table.domain.as_ref() {
+                    let mut domain = domain.borrow_mut();
+                    if domain.map.contains_key(&table.columns[0].value.borrow().to_string()) {
+                      table.clear_columns();
+                      table = tables.pop().unwrap();
+                      continue 'restart;
+                    }
+                    domain.map.insert(table.columns[0].value.borrow().to_string(), 0);
+                    // The for loop below will now write out the new row
+                  }
                 }
               }
 
               // Now write out the other column values
               for i in 0..table.columns.len() {
-                if table.columns[i].subtable.is_some() { continue; }
+                if table.columns[i].subtable.is_some() && !table.columns[i].subtable.as_ref().unwrap().normalized { continue; }
                 if table.columns[i].hide {
                   table.columns[i].value.borrow_mut().clear();
                   continue;
