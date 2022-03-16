@@ -262,12 +262,13 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     let mut subtable: Option<Table> = match col["cols"].is_badvalue() {
       true => None,
       false => {
-        if norm.is_some() && col["file"].is_badvalue() { // Normalized subtable; writes its primary key into the parent table
+        if norm.is_some() && col["file"].is_badvalue() { // Many-to-one relation (subtable with fkey in parent table)
           let mut subtable = add_table(colname, &path, norm, settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), None);
           subtable.normalized = true;
           Some(subtable)
         }
-        else {
+        else { // If norm.is_some(): many-to-many relation (this file will contain the crosslink table)
+               // Otherwise: one-to-many relation (this file will contain the subtable with the parent table fkey)
           let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable {} has no 'file' entry", colname));
           if table.columns.is_empty() { fatalerr!("Error: table '{}' cannot have a subtable as first column", name); }
           Some(add_table(colname, &path, Some(filename), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), Some(format!("{} {}", name, table.columns[0].datatype))))
@@ -286,9 +287,10 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     let domain = match norm {
       Some(filename) => {
         if filename == "true" { fatalerr!("Error: 'norm' option now takes a file path instead of a boolean"); }
-        let file = match col["file"].is_badvalue() {
-          true => None,           // One-to-many relation
-          false => Some(filename) // Many-to-many relation
+        let file = match subtable {
+          Some(_) if col["file"].is_badvalue() => None, // Many-to-one relation (subtable with fkey in parent table)
+          Some(_) => Some(filename),                    // Many-to-many relation (subtable with crosslink table)
+          None => Some(filename)                        // Many-to-one relation (single column) with auto serial
         };
         let mut domain = Domain::new(colname, colpath, file, settings);
         domain.table.columns.push(Column { name: String::from("id"), path: String::new(), datatype: String::from("integer"), ..Default::default()});
