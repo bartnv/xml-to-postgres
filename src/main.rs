@@ -324,10 +324,10 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
         fatalerr!("Error: filtering (incl/excl) and 'conv' cannot be used together on a single column");
       }
       if find.is_some() && !settings.hush_notice {
-        eprintln!("Notice: when using filtering (incl/excl) and find/replace on a single column, the filter is checked before replacements");
+        eprintln!("Notice: when using filtering (incl/excl) and find/replace on a single column, the filter is checked after replacements");
       }
       if aggr.is_some() && !settings.hush_notice {
-        eprintln!("Notice: when using filtering (incl/excl) and aggregation on a single column, the filter is checked at each step of aggregation separately");
+        eprintln!("Notice: when using filtering (incl/excl) and aggregation on a single column, the filter is checked after aggregation");
       }
     }
     if bbox.is_some() && (convert.is_none() || convert.unwrap() != "gml-to-ewkb") && !settings.hush_warning {
@@ -561,18 +561,6 @@ fn main() {
                   if table.columns[i].value.borrow().is_empty() && !settings.hush_warning {
                     eprintln!("Warning: column {} requested attribute {} not found", table.columns[i].name, request);
                   }
-                  if let Some(re) = &table.columns[i].include {
-                    if !re.is_match(&table.columns[i].value.borrow()) {
-                      filtered = true;
-                      table.clear_columns();
-                    }
-                  }
-                  if let Some(re) = &table.columns[i].exclude {
-                    if re.is_match(&table.columns[i].value.borrow()) {
-                      filtered = true;
-                      table.clear_columns();
-                    }
-                  }
                   if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
                     let mut value = table.columns[i].value.borrow_mut();
                     *value = value.replace(s, r);
@@ -623,20 +611,6 @@ fn main() {
               else {
                 table.columns[i].value.borrow_mut().push_str(&decoded.cow_replace("\\", "\\\\").cow_replace("\r", "\\r").cow_replace("\n", "\\n").cow_replace("\t", "\\t"));
               }
-              if let Some(re) = &table.columns[i].include {
-                if !re.is_match(&table.columns[i].value.borrow()) {
-                  filtered = true;
-                  table.clear_columns();
-                  break;
-                }
-              }
-              if let Some(re) = &table.columns[i].exclude {
-                if re.is_match(&table.columns[i].value.borrow()) {
-                  filtered = true;
-                  table.clear_columns();
-                  break;
-                }
-              }
               if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
                 let mut value = table.columns[i].value.borrow_mut();
                 *value = value.replace(s, r);
@@ -647,12 +621,29 @@ fn main() {
         },
         Ok(Event::End(_)) => {
           if path == table.path { // This is an end tag of the row path
+            for i in 0..table.columns.len() {
+              if let Some(re) = &table.columns[i].include {
+                if !re.is_match(&table.columns[i].value.borrow()) {
+                  filtered = true;
+                }
+              }
+              if let Some(re) = &table.columns[i].exclude {
+                if re.is_match(&table.columns[i].value.borrow()) {
+                  filtered = true;
+                }
+              }
+            }
+
             if filtered {
               filtered = false;
-              filtercount += 1;
+              table.clear_columns();
+              if tables.is_empty() { filtercount += 1; } // Only count filtered for the main table
+              else { // Subtable; nothing more to do in this case
+                table = tables.pop().unwrap();
+                continue 'restart;
+              }
             }
             else {
-
               if !tables.is_empty() { // This is a subtable
                 if !table.normalized { // Write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
                   let key = tables.last().unwrap().columns[0].value.borrow();
@@ -773,7 +764,6 @@ fn main() {
                 gmltoewkb = false;
                 if !gml_to_ewkb(&table.columns[i].value, &gmlcoll, table.columns[i].bbox.as_ref(), table.columns[i].multitype, &settings) {
                   filtered = true;
-                  table.clear_columns();
                 }
                 gmlcoll.clear();
                 break;
