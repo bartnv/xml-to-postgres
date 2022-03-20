@@ -38,18 +38,27 @@ struct Settings {
   hush_warning: bool
 }
 
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum Cardinality {
+  Default,
+  OneToMany,
+  ManyToOne,
+  ManyToMany,
+  None
+}
+
 struct Table<'a> {
   name: String,
   path: String,
   file: RefCell<Box<dyn Write>>,
   columns: Vec<Column<'a>>,
   domain: Box<Option<RefCell<Domain<'a>>>>,
-  normalized: bool,
+  cardinality: Cardinality,
   emit_copyfrom: bool,
   emit_starttransaction: bool
 }
 impl<'a> Table<'a> {
-  fn new(name: &str, path: &str, file: Option<&str>, settings: &Settings) -> Table<'a> {
+  fn new(name: &str, path: &str, file: Option<&str>, settings: &Settings, cardinality: Cardinality) -> Table<'a> {
     let mut ownpath = String::from(path);
     if !ownpath.is_empty() && !ownpath.starts_with('/') { ownpath.insert(0, '/'); }
     if ownpath.ends_with('/') { ownpath.pop(); }
@@ -68,9 +77,9 @@ impl<'a> Table<'a> {
       },
       columns: Vec::new(),
       domain: Box::new(None),
-      normalized: false,
-      emit_copyfrom: settings.emit_copyfrom,
-      emit_starttransaction: settings.emit_starttransaction
+      cardinality,
+      emit_copyfrom: if cardinality != Cardinality::None { settings.emit_copyfrom } else { false },
+      emit_starttransaction: if cardinality != Cardinality::None { settings.emit_starttransaction } else { false }
     }
   }
   fn write(&self, text: &str) {
@@ -99,7 +108,7 @@ impl<'a> Domain<'a> {
     Domain {
       lastid: 0,
       map: HashMap::new(),
-      table: Table::new(tabname, path, filename, settings)
+      table: Table::new(tabname, path, filename, settings, match filename { Some(_) => Cardinality::ManyToOne, None => Cardinality::None })
     }
   }
 }
@@ -238,8 +247,8 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, m
   true
 }
 
-fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Settings, colspec: &'a [Yaml], fkey: Option<String>) -> Table<'a> {
-  let mut table = Table::new(name, rowpath, outfile, settings);
+fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Settings, colspec: &'a [Yaml], fkey: Option<String>, cardinality: Cardinality) -> Table<'a> {
+  let mut table = Table::new(name, rowpath, outfile, settings, cardinality);
   for col in colspec {
     let colname = col["name"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'name' entry in configuration file"));
     let colpath = match col["seri"].as_bool() {
@@ -259,19 +268,29 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     };
     let mut datatype = col["type"].as_str().unwrap_or("text").to_string();
     let norm = col["norm"].as_str();
+    let file = col["file"].as_str();
+    let cardinality = match (file, norm) {
+      (None, None) => Cardinality::Default,
+      (Some(_), None) => Cardinality::OneToMany,
+      (None, Some(_)) => Cardinality::ManyToOne,
+      (Some(_), Some(_)) => Cardinality::ManyToMany
+    };
     let mut subtable: Option<Table> = match col["cols"].is_badvalue() {
       true => None,
       false => {
         if norm.is_some() && col["file"].is_badvalue() { // Many-to-one relation (subtable with fkey in parent table)
-          let mut subtable = add_table(colname, &path, norm, settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), None);
-          subtable.normalized = true;
+          let subtable = add_table(colname, &path, norm, settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), None, cardinality);
           Some(subtable)
         }
-        else { // If norm.is_some(): many-to-many relation (this file will contain the crosslink table)
-               // Otherwise: one-to-many relation (this file will contain the subtable with the parent table fkey)
+        else if norm.is_some() { // Many-to-many relation (this file will contain the crosslink table)
           let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable {} has no 'file' entry", colname));
           if table.columns.is_empty() { fatalerr!("Error: table '{}' cannot have a subtable as first column", name); }
-          Some(add_table(colname, &path, Some(filename), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), Some(format!("{} {}", name, table.columns[0].datatype))))
+          Some(add_table(colname, &path, Some(filename), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), Some(format!("{} {}", name, table.columns[0].datatype)), cardinality))
+        }
+        else { // One-to-many relation (this file will contain the subtable with the parent table fkey)
+          let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable {} has no 'file' entry", colname));
+          if table.columns.is_empty() { fatalerr!("Error: table '{}' cannot have a subtable as first column", name); }
+          Some(add_table(colname, &path, Some(filename), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), Some(format!("{} {}", name, table.columns[0].datatype)), cardinality))
         }
       }
     };
@@ -288,14 +307,25 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       Some(filename) => {
         if filename == "true" { fatalerr!("Error: 'norm' option now takes a file path instead of a boolean"); }
         let file = match subtable {
-          Some(_) if col["file"].is_badvalue() => None, // Many-to-one relation (subtable with fkey in parent table)
-          Some(_) => Some(filename),                    // Many-to-many relation (subtable with crosslink table)
-          None => Some(filename)                        // Many-to-one relation (single column) with auto serial
+          Some(_) if col["file"].is_badvalue() => None, // Many-to-one relation (subtable with fkey in parent table); rows go into subtable file
+          Some(_) => Some(filename),                    // Many-to-many relation (subtable with crosslink table); rows go into this file
+          None => Some(filename)                        // Many-to-one relation (single column) with auto serial; rows go into this file
         };
         let mut domain = Domain::new(colname, colpath, file, settings);
-        domain.table.columns.push(Column { name: String::from("id"), path: String::new(), datatype: String::from("integer"), ..Default::default()});
-        domain.table.columns.push(Column { name: String::from("value"), path: String::new(), datatype, ..Default::default()});
-        emit_preamble(&domain.table, settings, None);
+        if file.is_some() {
+          if subtable.is_some() {
+            for col in col["cols"].as_vec().unwrap() {
+              let colname = col["name"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'name' entry in configuration file"));
+              let datatype = col["type"].as_str().unwrap_or("text");
+              domain.table.columns.push(Column { name: colname.to_string(), path: String::new(), datatype: datatype.to_string(), ..Default::default() });
+            }
+          }
+          else {
+            domain.table.columns.push(Column { name: String::from("id"), path: String::new(), datatype: String::from("integer"), ..Default::default() });
+            domain.table.columns.push(Column { name: colname.to_string(), path: String::new(), datatype, ..Default::default() });
+          }
+          emit_preamble(&domain.table, settings, None);
+        }
         datatype = String::from("integer");
         if let Some(ref mut table) = subtable { // Push the domain down to the subtable
           table.domain = Box::new(Some(RefCell::new(domain)));
@@ -351,28 +381,40 @@ fn emit_preamble(table: &Table, settings: &Settings, fkey: Option<String>) {
     table.write(&format!("DROP TABLE IF EXISTS {};\n", table.name));
   }
   if settings.emit_createtable {
-    let mut cols = table.columns.iter().filter_map(|c| {
-      if c.hide || c.subtable.is_some() { return None; }
-      let mut spec = String::from(&c.name);
-      spec.push(' ');
-      spec.push_str(&c.datatype);
-      Some(spec)
-    }).collect::<Vec<String>>().join(", ");
-    if fkey.is_some() { cols.insert_str(0, &format!("{}, ", fkey.as_ref().unwrap())); }
-    table.write(&format!("CREATE TABLE IF NOT EXISTS {} ({});\n", table.name, cols));
+    if table.cardinality == Cardinality::ManyToMany {
+      let fkey = fkey.as_ref().unwrap();
+      table.write(&format!("CREATE TABLE IF NOT EXISTS {}_{} ({}, {} {});\n", fkey.split_once(' ').unwrap().0, table.name, fkey, table.name, table.columns[0].datatype));
+    }
+    else {
+      let mut cols = table.columns.iter().filter_map(|c| {
+        if c.hide || (c.subtable.is_some() && c.subtable.as_ref().unwrap().cardinality != Cardinality::ManyToOne) { return None; }
+        let mut spec = String::from(&c.name);
+        spec.push(' ');
+        spec.push_str(&c.datatype);
+        Some(spec)
+      }).collect::<Vec<String>>().join(", ");
+      if fkey.is_some() { cols.insert_str(0, &format!("{}, ", fkey.as_ref().unwrap())); }
+      table.write(&format!("CREATE TABLE IF NOT EXISTS {} ({});\n", table.name, cols));
+    }
   }
   if settings.emit_truncate {
     table.write(&format!("TRUNCATE {};\n", table.name));
   }
   if settings.emit_copyfrom {
-    let cols = table.columns.iter().filter_map(|c| {
-      if c.hide || c.subtable.is_some() { return None; }
-      Some(String::from(&c.name))
-    }).collect::<Vec<String>>().join(", ");
-    if fkey.is_some() {
-      table.write(&format!("COPY {} ({}, {}) FROM stdin;\n", table.name, fkey.unwrap().split(' ').next().unwrap(), cols));
+    if table.cardinality == Cardinality::ManyToMany {
+      let parent = fkey.as_ref().unwrap().split_once(' ').unwrap().0;
+      table.write(&format!("COPY {}_{} ({}, {}) FROM stdin;\n", parent, table.name, parent, table.name));
     }
-    else { table.write(&format!("COPY {} ({}) FROM stdin;\n", table.name, cols)); }
+    else {
+      let cols = table.columns.iter().filter_map(|c| {
+        if c.hide || (c.subtable.is_some() && c.subtable.as_ref().unwrap().cardinality != Cardinality::ManyToOne) { return None; }
+        Some(String::from(&c.name))
+      }).collect::<Vec<String>>().join(", ");
+      if fkey.is_some() {
+        table.write(&format!("COPY {} ({}, {}) FROM stdin;\n", table.name, fkey.unwrap().split(' ').next().unwrap(), cols));
+      }
+      else { table.write(&format!("COPY {} ({}) FROM stdin;\n", table.name, cols)); }
+    }
   }
 }
 
@@ -423,7 +465,7 @@ fn main() {
     hush_notice: hush.contains("notice"),
     hush_warning: hush.contains("warning")
   };
-  let maintable = add_table(name, rowpath, outfile, &settings, colspec, None);
+  let maintable = add_table(name, rowpath, outfile, &settings, colspec, None, Cardinality::Default);
   if !settings.skip.is_empty() {
     if !settings.skip.starts_with('/') { settings.skip.insert(0, '/'); }
     settings.skip.insert_str(0, &maintable.path); // Maintable path is normalized in add_table()
@@ -647,7 +689,7 @@ fn main() {
             }
             else {
               if !tables.is_empty() { // This is a subtable
-                if !table.normalized { // Write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
+                if table.cardinality != Cardinality::ManyToOne { // Write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
                   let key = tables.last().unwrap().columns[0].value.borrow();
                   if key.is_empty() && !settings.hush_warning { println!("Warning: subtable {} has no foreign key for parent (you may need to add a 'seri' column)", table.name); }
                   table.write(&format!("{}\t", key));
@@ -705,7 +747,7 @@ fn main() {
 
               // Now write out the other column values
               for i in 0..table.columns.len() {
-                if table.columns[i].subtable.is_some() && !table.columns[i].subtable.as_ref().unwrap().normalized { continue; }
+                if table.columns[i].subtable.is_some() && table.columns[i].subtable.as_ref().unwrap().cardinality != Cardinality::ManyToOne { continue; }
                 if table.columns[i].hide {
                   table.columns[i].value.borrow_mut().clear();
                   continue;
