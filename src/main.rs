@@ -247,7 +247,7 @@ fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, m
   true
 }
 
-fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Settings, colspec: &'a [Yaml], fkey: Option<String>, cardinality: Cardinality) -> Table<'a> {
+fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Settings, colspec: &'a [Yaml], cardinality: Cardinality) -> Table<'a> {
   let mut table = Table::new(name, rowpath, outfile, settings, cardinality);
   for col in colspec {
     let colname = col["name"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'name' entry in configuration file"));
@@ -276,21 +276,36 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       (Some(_), Some(_)) => Cardinality::ManyToMany
     };
     let mut subtable: Option<Table> = match col["cols"].is_badvalue() {
-      true => None,
+      true => match cardinality {
+        Cardinality::OneToMany => {
+          let filename = col["file"].as_str().unwrap();
+          if table.columns.is_empty() { fatalerr!("Error: table '{}' cannot have a subtable as first column", name); }
+          let mut subtable = add_table(colname, &path, Some(filename), settings, &[], cardinality);
+          subtable.columns.push(Column { name: colname.to_string(), path: path.clone(), datatype: datatype.to_string(), ..Default::default() });
+          emit_preamble(&subtable, settings, Some(format!("{} {}", name, table.columns[0].datatype)));
+          Some(subtable)
+        },
+        _ => None
+      },
       false => {
         if norm.is_some() && col["file"].is_badvalue() { // Many-to-one relation (subtable with fkey in parent table)
-          let subtable = add_table(colname, &path, norm, settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), None, cardinality);
+          let subtable = add_table(colname, &path, norm, settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), cardinality);
+          emit_preamble(&subtable, settings, None);
           Some(subtable)
         }
         else if norm.is_some() { // Many-to-many relation (this file will contain the crosslink table)
           let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable {} has no 'file' entry", colname));
           if table.columns.is_empty() { fatalerr!("Error: table '{}' cannot have a subtable as first column", name); }
-          Some(add_table(colname, &path, Some(filename), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), Some(format!("{} {}", name, table.columns[0].datatype)), cardinality))
+          let subtable = add_table(colname, &path, Some(filename), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), cardinality);
+          emit_preamble(&subtable, settings, Some(format!("{} {}", name, table.columns[0].datatype)));
+          Some(subtable)
         }
         else { // One-to-many relation (this file will contain the subtable with the parent table fkey)
           let filename = col["file"].as_str().unwrap_or_else(|| fatalerr!("Error: subtable {} has no 'file' entry", colname));
           if table.columns.is_empty() { fatalerr!("Error: table '{}' cannot have a subtable as first column", name); }
-          Some(add_table(colname, &path, Some(filename), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), Some(format!("{} {}", name, table.columns[0].datatype)), cardinality))
+          let subtable = add_table(colname, &path, Some(filename), settings, col["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: subtable 'cols' entry is not an array")), cardinality);
+          emit_preamble(&subtable, settings, Some(format!("{} {}", name, table.columns[0].datatype)));
+          Some(subtable)
         }
       }
     };
@@ -370,7 +385,6 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     table.columns.push(column);
   }
 
-  emit_preamble(&table, settings, fkey);
   table
 }
 fn emit_preamble(table: &Table, settings: &Settings, fkey: Option<String>) {
@@ -465,7 +479,8 @@ fn main() {
     hush_notice: hush.contains("notice"),
     hush_warning: hush.contains("warning")
   };
-  let maintable = add_table(name, rowpath, outfile, &settings, colspec, None, Cardinality::Default);
+  let maintable = add_table(name, rowpath, outfile, &settings, colspec, Cardinality::Default);
+  emit_preamble(&maintable, &settings, None);
   if !settings.skip.is_empty() {
     if !settings.skip.starts_with('/') { settings.skip.insert(0, '/'); }
     settings.skip.insert_str(0, &maintable.path); // Maintable path is normalized in add_table()
