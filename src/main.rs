@@ -135,20 +135,6 @@ struct Column<'a> {
   bbox: Option<BBox>,
   multitype: bool
 }
-impl std::borrow::Borrow<str> for Column<'_> {
-  fn borrow(&self) -> &str {
-    &*self.name
-  }
-}
-impl std::fmt::Debug for Column<'_> {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("Column")
-      .field("name", &self.name)
-      .field("path", &self.path)
-      .field("attr", &self.attr)
-      .finish()
-  }
-}
 
 #[derive(Debug)]
 struct Geometry {
@@ -178,6 +164,34 @@ impl BBox {
       BBox { minx: caps[1].parse().unwrap(), miny: caps[2].parse().unwrap(), maxx: caps[3].parse().unwrap(), maxy: caps[4].parse().unwrap() }
     )
   }
+}
+
+#[derive(PartialEq, Debug)]
+enum Step {
+  Next,
+  Restart,
+  Done
+}
+struct State<'a, 'b> {
+  settings: Settings,
+  reader: Reader<Box<dyn BufRead>>,
+  tables: Vec<&'b Table<'a>>,
+  table: &'b Table<'a>,
+  rowpath: String,
+  path: String,
+  parentcol: Option<&'b Column<'a>>,
+  filtered: bool,
+  skipped: bool,
+  fullcount: u64,
+  filtercount: u64,
+  skipcount: u64,
+  xmltotext: bool,
+  text: String,
+  gmltoewkb: bool,
+  gmlpos: bool,
+  gmlcoll: Vec<Geometry>,
+  trimre: Regex,
+  step: Step
 }
 
 fn gml_to_ewkb(cell: &RefCell<String>, coll: &[Geometry], bbox: Option<&BBox>, multitype: bool, settings: &Settings) -> bool {
@@ -460,17 +474,6 @@ fn main() {
     &YamlLoader::load_from_str(&config_str).unwrap_or_else(|err| fatalerr!("Error: invalid syntax in configuration file: {}", err))[0]
   };
 
-  let mut reader;
-  reader = Reader::from_reader(bufread);
-  reader.trim_text(true)
-        .expand_empty_elements(true);
-
-  let mut path = String::new();
-  let mut buf = Vec::new();
-  let mut fullcount = 0;
-  let mut filtercount = 0;
-  let mut skipcount = 0;
-
   let name = config["name"].as_str().unwrap_or_else(|| fatalerr!("Error: no valid 'name' entry in configuration file"));
   let rowpath = config["path"].as_str().unwrap_or_else(|| fatalerr!("Error: no valid 'path' entry in configuration file"));
   let colspec = config["cols"].as_vec().unwrap_or_else(|| fatalerr!("Error: no valid 'cols' array in configuration file"));
@@ -489,388 +492,403 @@ fn main() {
     hush_notice: hush.contains("notice"),
     hush_warning: hush.contains("warning")
   };
+
   let maintable = add_table(name, rowpath, outfile, &settings, colspec, Cardinality::Default);
   emit_preamble(&maintable, &settings, None);
   if !settings.skip.is_empty() {
     if !settings.skip.starts_with('/') { settings.skip.insert(0, '/'); }
     settings.skip.insert_str(0, &maintable.path); // Maintable path is normalized in add_table()
   }
-  let mut tables: Vec<&Table> = Vec::new();
-  let mut table = &maintable;
-  let mut parentcol = None;
 
-  let mut filtered = false;
-  let mut skipped = false;
-  let mut xmltotext = false;
-  let mut text = String::new();
-  let mut gmltoewkb = false;
-  let mut gmlpos = false;
-  let mut gmlcoll: Vec<Geometry> = vec![];
-  let trimre = Regex::new("[ \n\r\t]*\n[ \n\r\t]*").unwrap();
+  let mut reader;
+  reader = Reader::from_reader(bufread);
+  reader.trim_text(true)
+        .expand_empty_elements(true);
+  let mut state = State {
+    settings,
+    reader: reader,
+    tables: Vec::new(),
+    table: &maintable,
+    rowpath: rowpath.to_string(),
+    path: String::new(),
+    parentcol: None,
+    filtered: false,
+    skipped: false,
+    fullcount: 0,
+    filtercount: 0,
+    skipcount: 0,
+    xmltotext: false,
+    text: String::new(),
+    gmltoewkb: false,
+    gmlpos: false,
+    gmlcoll: vec![],
+    step: Step::Next,
+    trimre: Regex::new("[ \n\r\t]*\n[ \n\r\t]*").unwrap()
+  };
 
+  let mut buf = Vec::new();
   let start = Instant::now();
-  let mut loops;
   'main: loop { // Main loop over the XML nodes
-    let event = reader.read_event(&mut buf);
-    loops = 0;
-    'restart: loop { // Restart loop to be able to process a node twice
-      loops += 1;
-      match event {
-        Ok(Event::Start(ref e)) => {
-          if loops == 1 {
-            path.push('/');
-            path.push_str(reader.decode(e.name()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name()), err)));
+    let event = state.reader.read_event(&mut buf).unwrap_or_else(|e| fatalerr!("Error: failed to parse XML at position {}: {}", state.reader.buffer_position(), e));
+    loop { // Restart loop to be able to process a node twice
+      state.step = process_event(&event, &mut state);
+      match state.step {
+        Step::Next => break,
+        Step::Restart => continue,
+        Step::Done => break 'main
+      }
+    }
+    buf.clear();
+  }
+  if !state.settings.hush_info {
+    eprintln!("Info: [{}] {} rows processed in {} seconds{}{}",
+      maintable.name,
+      state.fullcount-state.filtercount-state.skipcount,
+      start.elapsed().as_secs(),
+      match state.filtercount { 0 => "".to_owned(), n => format!(" ({} excluded)", n) },
+      match state.skipcount { 0 => "".to_owned(), n => format!(" ({} skipped)", n) }
+    );
+  }
+}
+
+fn process_event(event: &Event, mut state: &mut State) -> Step {
+  let table = &state.table;
+  match event {
+    Event::Start(ref e) => {
+      if state.step == Step::Next {
+        state.path.push('/');
+        state.path.push_str(state.reader.decode(e.name()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name()), err)));
+      }
+      if state.filtered || state.skipped { return Step::Next; }
+      if state.path == state.settings.skip {
+        state.skipped = true;
+        return Step::Next;
+      }
+      else if state.xmltotext {
+        state.text.push_str(&format!("<{}>", &e.unescape_and_decode(&state.reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name()), err))));
+        return Step::Next;
+      }
+      else if state.gmltoewkb {
+        match state.reader.decode(e.name()) {
+          Err(_) => (),
+          Ok(tag) => match tag {
+            "gml:Point" => {
+              state.gmlcoll.push(Geometry::new(1));
+              state.gmlcoll.last_mut().unwrap().rings.push(Vec::new());
+            },
+            "gml:LineString" => state.gmlcoll.push(Geometry::new(2)),
+            "gml:Polygon" => state.gmlcoll.push(Geometry::new(3)),
+            "gml:MultiPolygon" => (),
+            "gml:polygonMember" => (),
+            "gml:exterior" => (),
+            "gml:interior" => (),
+            "gml:LinearRing" => state.gmlcoll.last_mut().unwrap().rings.push(Vec::new()),
+            "gml:posList" => state.gmlpos = true,
+            "gml:pos" => state.gmlpos = true,
+            _ => if !state.settings.hush_warning { eprintln!("Warning: GML type {} not supported", tag); }
           }
-          if filtered || skipped { break; }
-          if path == settings.skip {
-            skipped = true;
-            break;
-          }
-          else if xmltotext {
-            text.push_str(&format!("<{}>", &e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name()), err))));
-            break;
-          }
-          else if gmltoewkb {
-            match reader.decode(e.name()) {
-              Err(_) => (),
-              Ok(tag) => match tag {
-                "gml:Point" => {
-                  gmlcoll.push(Geometry::new(1));
-                  gmlcoll.last_mut().unwrap().rings.push(Vec::new());
-                },
-                "gml:LineString" => gmlcoll.push(Geometry::new(2)),
-                "gml:Polygon" => gmlcoll.push(Geometry::new(3)),
-                "gml:MultiPolygon" => (),
-                "gml:polygonMember" => (),
-                "gml:exterior" => (),
-                "gml:interior" => (),
-                "gml:LinearRing" => gmlcoll.last_mut().unwrap().rings.push(Vec::new()),
-                "gml:posList" => gmlpos = true,
-                "gml:pos" => gmlpos = true,
-                _ => if !settings.hush_warning { eprintln!("Warning: GML type {} not supported", tag); }
-              }
-            }
-            for res in e.attributes() {
-              match res {
-                Err(_) => (),
-                Ok(attr) => {
-                  let key = reader.decode(attr.key);
-                  match key {
-                    Ok("srsName") => {
-                      let mut value = String::from(reader.decode(&attr.value).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute '{}': {}", String::from_utf8_lossy(&attr.value), err)));
-                      if let Some(i) = value.rfind("::") {
-                        value = value.split_off(i+2);
-                      }
-                      match value.parse::<u32>() {
-                        Ok(int) => {
-                          if let Some(geom) = gmlcoll.last_mut() { geom.srid = int };
-                        },
-                        Err(_) => if !settings.hush_warning { eprintln!("Warning: invalid srsName {} in GML", value); }
-                      }
+        }
+        for res in e.attributes() {
+          match res {
+            Err(_) => (),
+            Ok(attr) => {
+              let key = state.reader.decode(attr.key);
+              match key {
+                Ok("srsName") => {
+                  let mut value = String::from(state.reader.decode(&attr.value).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute '{}': {}", String::from_utf8_lossy(&attr.value), err)));
+                  if let Some(i) = value.rfind("::") {
+                    value = value.split_off(i+2);
+                  }
+                  match value.parse::<u32>() {
+                    Ok(int) => {
+                      if let Some(geom) = state.gmlcoll.last_mut() { geom.srid = int };
                     },
-                    Ok("srsDimension") => {
-                      let value = reader.decode(&attr.value).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute '{}': {}", String::from_utf8_lossy(&attr.value), err));
-                      match value.parse::<u8>() {
-                        Ok(int) => {
-                          if let Some(geom) = gmlcoll.last_mut() { geom.dims = int };
-                        },
-                        Err(_) => if !settings.hush_warning { eprintln!("Warning: invalid srsDimension {} in GML", value); }
-                      }
-                    }
-                    _ => ()
+                    Err(_) => if !state.settings.hush_warning { eprintln!("Warning: invalid srsName {} in GML", value); }
+                  }
+                },
+                Ok("srsDimension") => {
+                  let value = state.reader.decode(&attr.value).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute '{}': {}", String::from_utf8_lossy(&attr.value), err));
+                  match value.parse::<u8>() {
+                    Ok(int) => {
+                      if let Some(geom) = state.gmlcoll.last_mut() { geom.dims = int };
+                    },
+                    Err(_) => if !state.settings.hush_warning { eprintln!("Warning: invalid srsDimension {} in GML", value); }
                   }
                 }
+                _ => ()
               }
             }
-            break;
           }
-          else if path.len() >= table.path.len() {
-            if path == maintable.path { fullcount += 1; }
-
-            for i in 0..table.columns.len() {
-              if path == table.columns[i].path { // This start tag matches one of the defined columns
-
-                // Handle the 'seri' case where this column is a virtual auto-incrementing serial
-                if let Some(ref serial) = table.columns[i].serial {
-                  if table.columns[i].value.borrow().is_empty() {
-                    let id = serial.get()+1;
-                    table.columns[i].value.borrow_mut().push_str(&id.to_string());
-                    serial.set(id);
-                    continue 'restart; // Continue the restart loop because another column may also match the current path
-                  }
-                }
-
-                // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
-                if table.columns[i].subtable.is_some() {
-                  tables.push(table);
-                  parentcol = Some(&table.columns[i]);
-                  table = table.columns[i].subtable.as_ref().unwrap();
-                  continue 'restart; // Continue the restart loop because a subtable column may also match the current path
-                }
-
-                // Handle the 'attr' case where the content is read from an attribute of this tag
-                if let Some(request) = table.columns[i].attr {
-                  for res in e.attributes() {
-                    if let Ok(attr) = res {
-                      if let Ok(key) = reader.decode(attr.key) {
-                        if key == request {
-                          if let Ok(value) = reader.decode(&attr.value) {
-                            if !table.columns[i].value.borrow().is_empty() {
-                              if !allow_iteration(&table.columns[i], &settings) { break; }
-                              if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
-                            }
-                            table.columns[i].value.borrow_mut().push_str(value)
-                          }
-                          else if !settings.hush_warning { eprintln!("Warning: failed to decode attribute {} for column {}", request, table.columns[i].name); }
-                          break;
+        }
+        return Step::Next;
+      }
+      else if state.path.len() >= table.path.len() {
+        if state.path == state.rowpath { state.fullcount += 1; }
+        for i in 0..table.columns.len() {
+          if state.path == table.columns[i].path { // This start tag matches one of the defined columns
+            // Handle the 'seri' case where this column is a virtual auto-incrementing serial
+            if let Some(ref serial) = table.columns[i].serial {
+              if table.columns[i].value.borrow().is_empty() {
+                let id = serial.get()+1;
+                table.columns[i].value.borrow_mut().push_str(&id.to_string());
+                serial.set(id);
+                return Step::Restart; // Continue the restart loop because another column may also match the current path
+              }
+            }
+            // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
+            if table.columns[i].subtable.is_some() {
+              state.tables.push(table);
+              state.parentcol = Some(&table.columns[i]);
+              state.table = table.columns[i].subtable.as_ref().unwrap();
+              return Step::Restart; // Continue the restart loop because a subtable column may also match the current path
+            }
+            // Handle the 'attr' case where the content is read from an attribute of this tag
+            if let Some(request) = table.columns[i].attr {
+              for res in e.attributes() {
+                if let Ok(attr) = res {
+                  if let Ok(key) = state.reader.decode(attr.key) {
+                    if key == request {
+                      if let Ok(value) = state.reader.decode(&attr.value) {
+                        if !table.columns[i].value.borrow().is_empty() {
+                          if !allow_iteration(&table.columns[i], &state.settings) { return Step::Next; }
+                          if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
                         }
+                        table.columns[i].value.borrow_mut().push_str(value)
                       }
-                      else if !settings.hush_warning { eprintln!("Warning: failed to decode an attribute for column {}", table.columns[i].name); }
+                      else if !state.settings.hush_warning { eprintln!("Warning: failed to decode attribute {} for column {}", request, table.columns[i].name); }
+                      return Step::Next;
                     }
-                    else if !settings.hush_warning { eprintln!("Warning: failed to read attributes for column {}", table.columns[i].name); }
                   }
-                  if table.columns[i].value.borrow().is_empty() && !settings.hush_warning {
-                    eprintln!("Warning: column {} requested attribute {} not found", table.columns[i].name, request);
-                  }
-                  if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
-                    let mut value = table.columns[i].value.borrow_mut();
-                    *value = value.replace(s, r);
-                  }
+                  else if !state.settings.hush_warning { eprintln!("Warning: failed to decode an attribute for column {}", table.columns[i].name); }
                 }
-
-                // Set the appropriate convert flag for the following data in case the 'conv' option is present
-                match table.columns[i].convert {
-                  None => (),
-                  Some("xml-to-text") => xmltotext = true,
-                  Some("gml-to-ewkb") => gmltoewkb = true,
-                  Some(_) => (),
-                }
-                break;
+                else if !state.settings.hush_warning { eprintln!("Warning: failed to read attributes for column {}", table.columns[i].name); }
               }
-            }
-          }
-        },
-        Ok(Event::Text(ref e)) => {
-          if filtered || skipped { break; }
-          if xmltotext {
-            text.push_str(&e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)));
-            break;
-          }
-          else if gmltoewkb {
-            if gmlpos {
-              let value = String::from(&e.unescape_and_decode(&reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML gmlpos '{}': {}", String::from_utf8_lossy(e), err)));
-              for pos in value.split(' ') {
-                gmlcoll.last_mut().unwrap().rings.last_mut().unwrap().push(fast_float::parse(pos).unwrap_or_else(|err| fatalerr!("Error: failed to parse GML pos '{}' into float: {}", pos, err)));
-              }
-            }
-            break;
-          }
-          for i in 0..table.columns.len() {
-            if path == table.columns[i].path {
-              if table.columns[i].attr.is_some() || table.columns[i].serial.is_some() { break; }
-              if !table.columns[i].value.borrow().is_empty() {
-                if !allow_iteration(&table.columns[i], &settings) { break; }
-                if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
-              }
-
-              let unescaped = e.unescaped().unwrap_or_else(|err| fatalerr!("Error: failed to unescape XML text node '{}': {}", String::from_utf8_lossy(e), err));
-              let decoded = reader.decode(&unescaped).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err));
-              if table.columns[i].trim {
-                let trimmed = trimre.replace_all(decoded, " ");
-                table.columns[i].value.borrow_mut().push_str(&trimmed.cow_replace("\\", "\\\\").cow_replace("\t", "\\t"));
-              }
-              else {
-                table.columns[i].value.borrow_mut().push_str(&decoded.cow_replace("\\", "\\\\").cow_replace("\r", "\\r").cow_replace("\n", "\\n").cow_replace("\t", "\\t"));
+              if table.columns[i].value.borrow().is_empty() && !state.settings.hush_warning {
+                eprintln!("Warning: column {} requested attribute {} not found", table.columns[i].name, request);
               }
               if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
                 let mut value = table.columns[i].value.borrow_mut();
                 *value = value.replace(s, r);
               }
-              break;
+            }
+            // Set the appropriate convert flag for the following data in case the 'conv' option is present
+            match table.columns[i].convert {
+              None => (),
+              Some("xml-to-text") => state.xmltotext = true,
+              Some("gml-to-ewkb") => state.gmltoewkb = true,
+              Some(_) => (),
+            }
+            return Step::Next;
+          }
+        }
+      }
+    },
+    Event::Text(ref e) => {
+      if state.filtered || state.skipped { return Step::Next; }
+      if state.xmltotext {
+        state.text.push_str(&e.unescape_and_decode(&state.reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)));
+        return Step::Next;
+      }
+      else if state.gmltoewkb {
+        if state.gmlpos {
+          let value = String::from(&e.unescape_and_decode(&state.reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML gmlpos '{}': {}", String::from_utf8_lossy(e), err)));
+          for pos in value.split(' ') {
+            state.gmlcoll.last_mut().unwrap().rings.last_mut().unwrap().push(fast_float::parse(pos).unwrap_or_else(|err| fatalerr!("Error: failed to parse GML pos '{}' into float: {}", pos, err)));
+          }
+        }
+        return Step::Next;
+      }
+      for i in 0..table.columns.len() {
+        if state.path == table.columns[i].path {
+          if table.columns[i].attr.is_some() || table.columns[i].serial.is_some() { return Step::Next; }
+          if !table.columns[i].value.borrow().is_empty() {
+            if !allow_iteration(&table.columns[i], &state.settings) { return Step::Next; }
+            if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
+          }
+          let unescaped = e.unescaped().unwrap_or_else(|err| fatalerr!("Error: failed to unescape XML text node '{}': {}", String::from_utf8_lossy(e), err));
+          let decoded = state.reader.decode(&unescaped).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err));
+          if table.columns[i].trim {
+            let trimmed = state.trimre.replace_all(decoded, " ");
+            table.columns[i].value.borrow_mut().push_str(&trimmed.cow_replace("\\", "\\\\").cow_replace("\t", "\\t"));
+          }
+          else {
+            table.columns[i].value.borrow_mut().push_str(&decoded.cow_replace("\\", "\\\\").cow_replace("\r", "\\r").cow_replace("\n", "\\n").cow_replace("\t", "\\t"));
+          }
+          if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
+            let mut value = table.columns[i].value.borrow_mut();
+            *value = value.replace(s, r);
+          }
+          return Step::Next;
+        }
+      }
+    },
+    Event::End(_) => {
+      if state.path == table.path { // This is an end tag of the row path
+        for i in 0..table.columns.len() {
+          if let Some(re) = &table.columns[i].include {
+            if !re.is_match(&table.columns[i].value.borrow()) {
+              state.filtered = true;
             }
           }
-        },
-        Ok(Event::End(_)) => {
-          if path == table.path { // This is an end tag of the row path
-            for i in 0..table.columns.len() {
-              if let Some(re) = &table.columns[i].include {
-                if !re.is_match(&table.columns[i].value.borrow()) {
-                  filtered = true;
-                }
-              }
-              if let Some(re) = &table.columns[i].exclude {
-                if re.is_match(&table.columns[i].value.borrow()) {
-                  filtered = true;
-                }
-              }
+          if let Some(re) = &table.columns[i].exclude {
+            if re.is_match(&table.columns[i].value.borrow()) {
+              state.filtered = true;
             }
-
-            if filtered {
-              filtered = false;
-              table.clear_columns();
-              if tables.is_empty() { filtercount += 1; } // Only count filtered for the main table
-              else { // Subtable; nothing more to do in this case
-                table = tables.pop().unwrap();
-                continue 'restart;
-              }
-            }
-            else {
-              if !tables.is_empty() { // This is a subtable
-                if table.cardinality != Cardinality::ManyToOne { // Write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
-                  let key = tables.last().unwrap().columns[0].value.borrow();
-                  if key.is_empty() && !settings.hush_warning { println!("Warning: subtable {} has no foreign key for parent (you may need to add a 'seri' column)", table.name); }
-                  table.write(&format!("{}\t", key));
-                  let rowid;
-                  if let Some(domain) = table.domain.as_ref() {
-                    let mut domain = domain.borrow_mut();
-                    if !domain.map.contains_key(&table.columns[0].value.borrow().to_string()) {
-                      domain.lastid += 1;
-                      rowid = domain.lastid;
-                      domain.map.insert(table.columns[0].value.borrow().to_string(), rowid);
-                      if table.columns.len() == 1 {
-                        domain.table.write(&format!("{}\t", rowid));
-                      }
-                      for i in 0..table.columns.len() {
-                        if table.columns[i].subtable.is_some() { continue; }
-                        if table.columns[i].hide { continue; }
-                        if i > 0 { domain.table.write("\t"); }
-                        if table.columns[i].value.borrow().is_empty() { domain.table.write("\\N"); }
-                        else if let Some(domain) = table.columns[i].domain.as_ref() {
-                          let mut domain = domain.borrow_mut();
-                          let id = match domain.map.get(&table.columns[i].value.borrow().to_string()) {
-                            Some(id) => *id,
-                            None => {
-                              domain.lastid += 1;
-                              let id = domain.lastid;
-                              domain.map.insert(table.columns[i].value.borrow().to_string(), id);
-                              domain.table.write(&format!("{}\t{}\n", id, *table.columns[i].value.borrow()));
-                              id
-                            }
-                          };
-                          domain.table.write(&format!("{}", id));
+          }
+        }
+        if state.filtered {
+          state.filtered = false;
+          table.clear_columns();
+          if state.tables.is_empty() { state.filtercount += 1; } // Only count filtered for the main table
+          else { // Subtable; nothing more to do in this case
+            state.table = state.tables.pop().unwrap();
+            return Step::Restart;
+          }
+        }
+        else {
+          if !state.tables.is_empty() { // This is a subtable
+            if table.cardinality != Cardinality::ManyToOne { // Write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
+              let key = state.tables.last().unwrap().columns[0].value.borrow();
+              if key.is_empty() && !state.settings.hush_warning { println!("Warning: subtable {} has no foreign key for parent (you may need to add a 'seri' column)", table.name); }
+              table.write(&format!("{}\t", key));
+              let rowid;
+              if let Some(domain) = table.domain.as_ref() {
+                let mut domain = domain.borrow_mut();
+                if !domain.map.contains_key(&table.columns[0].value.borrow().to_string()) {
+                  domain.lastid += 1;
+                  rowid = domain.lastid;
+                  domain.map.insert(table.columns[0].value.borrow().to_string(), rowid);
+                  if table.columns.len() == 1 {
+                    domain.table.write(&format!("{}\t", rowid));
+                  }
+                  for i in 0..table.columns.len() {
+                    if table.columns[i].subtable.is_some() { continue; }
+                    if table.columns[i].hide { continue; }
+                    if i > 0 { domain.table.write("\t"); }
+                    if table.columns[i].value.borrow().is_empty() { domain.table.write("\\N"); }
+                    else if let Some(domain) = table.columns[i].domain.as_ref() {
+                      let mut domain = domain.borrow_mut();
+                      let id = match domain.map.get(&table.columns[i].value.borrow().to_string()) {
+                        Some(id) => *id,
+                        None => {
+                          domain.lastid += 1;
+                          let id = domain.lastid;
+                          domain.map.insert(table.columns[i].value.borrow().to_string(), id);
+                          domain.table.write(&format!("{}\t{}\n", id, *table.columns[i].value.borrow()));
+                          id
                         }
-                        else {
-                          domain.table.write(&table.columns[i].value.borrow());
-                        }
-                      }
-                      domain.table.write("\n");
-                    }
-                    else { rowid = *domain.map.get(&table.columns[0].value.borrow().to_string()).unwrap(); }
-                    if table.columns.len() == 1 { // Single column many-to-many subtable; needs the id from the domain map
-                      table.write(&format!("{}" , rowid));
+                      };
+                      domain.table.write(&format!("{}", id));
                     }
                     else {
-                      if table.columns[0].value.borrow().is_empty() { println!("Warning: subtable {} has no primary key to normalize on", table.name); }
-                      table.write(&format!("{}" , table.columns[0].value.borrow())); // This is a many-to-many relation; write the two keys into the link table
+                      domain.table.write(&table.columns[i].value.borrow());
                     }
-                    table.write("\n");
-                    table.clear_columns();
-                    table = tables.pop().unwrap();
-                    continue 'restart;
                   }
+                  domain.table.write("\n");
                 }
-                else { // Normalized; write the id of this subtable into the parent table
-                  parentcol.unwrap().value.borrow_mut().push_str(&table.columns[0].value.borrow());
-                  if let Some(domain) = table.domain.as_ref() {
-                    let mut domain = domain.borrow_mut();
-                    if domain.map.contains_key(&table.columns[0].value.borrow().to_string()) {
-                      table.clear_columns();
-                      table = tables.pop().unwrap();
-                      continue 'restart;
-                    }
-                    domain.map.insert(table.columns[0].value.borrow().to_string(), 0);
-                    // The for loop below will now write out the new row
-                  }
-                }
-              }
-
-              // Now write out the other column values
-              for i in 0..table.columns.len() {
-                if table.columns[i].subtable.is_some() && table.columns[i].subtable.as_ref().unwrap().cardinality != Cardinality::ManyToOne { continue; }
-                if table.columns[i].hide {
-                  table.columns[i].value.borrow_mut().clear();
-                  continue;
-                }
-                if i > 0 { table.write("\t"); }
-                if table.columns[i].value.borrow().is_empty() { table.write("\\N"); }
-                else if let Some(domain) = table.columns[i].domain.as_ref() {
-                  let mut domain = domain.borrow_mut();
-                  let id = match domain.map.get(&table.columns[i].value.borrow().to_string()) {
-                    Some(id) => *id,
-                    None => {
-                      domain.lastid += 1;
-                      let id = domain.lastid;
-                      domain.map.insert(table.columns[i].value.borrow().to_string(), id);
-                      domain.table.write(&format!("{}\t{}\n", id, *table.columns[i].value.borrow()));
-                      id
-                    }
-                  };
-                  table.write(&format!("{}", id));
-                  table.columns[i].value.borrow_mut().clear();
+                else { rowid = *domain.map.get(&table.columns[0].value.borrow().to_string()).unwrap(); }
+                if table.columns.len() == 1 { // Single column many-to-many subtable; needs the id from the domain map
+                  table.write(&format!("{}" , rowid));
                 }
                 else {
-                  table.write(&table.columns[i].value.borrow());
-                  table.columns[i].value.borrow_mut().clear();
+                  if table.columns[0].value.borrow().is_empty() { println!("Warning: subtable {} has no primary key to normalize on", table.name); }
+                  table.write(&format!("{}" , table.columns[0].value.borrow())); // This is a many-to-many relation; write the two keys into the link table
                 }
+                table.write("\n");
+                table.clear_columns();
+                state.table = state.tables.pop().unwrap();
+                return Step::Restart;
               }
-              table.write("\n");
-              if !tables.is_empty() {
-                table = tables.pop().unwrap();
-                continue 'restart;
+            }
+            else { // Normalized; write the id of this subtable into the parent table
+              state.parentcol.unwrap().value.borrow_mut().push_str(&table.columns[0].value.borrow());
+              if let Some(domain) = table.domain.as_ref() {
+                let mut domain = domain.borrow_mut();
+                if domain.map.contains_key(&table.columns[0].value.borrow().to_string()) {
+                  table.clear_columns();
+                  state.table = state.tables.pop().unwrap();
+                  return Step::Restart;
+                }
+                domain.map.insert(table.columns[0].value.borrow().to_string(), 0);
+                // The for loop below will now write out the new row
               }
             }
           }
-          else if skipped && path == settings.skip {
-            skipped = false;
-            skipcount += 1;
-          }
-          let i = path.rfind('/').unwrap();
-          let tag = path.split_off(i);
-          if xmltotext {
-            text.push_str(&format!("<{}>", tag));
-            for i in 0..table.columns.len() {
-              if path == table.columns[i].path {
-                xmltotext = false;
-                if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
-                  text = text.replace(s, r);
+          // Now write out the other column values
+          for i in 0..table.columns.len() {
+            if table.columns[i].subtable.is_some() && table.columns[i].subtable.as_ref().unwrap().cardinality != Cardinality::ManyToOne { continue; }
+            if table.columns[i].hide {
+              table.columns[i].value.borrow_mut().clear();
+              continue;
+            }
+            if i > 0 { table.write("\t"); }
+            if table.columns[i].value.borrow().is_empty() { table.write("\\N"); }
+            else if let Some(domain) = table.columns[i].domain.as_ref() {
+              let mut domain = domain.borrow_mut();
+              let id = match domain.map.get(&table.columns[i].value.borrow().to_string()) {
+                Some(id) => *id,
+                None => {
+                  domain.lastid += 1;
+                  let id = domain.lastid;
+                  domain.map.insert(table.columns[i].value.borrow().to_string(), id);
+                  domain.table.write(&format!("{}\t{}\n", id, *table.columns[i].value.borrow()));
+                  id
                 }
-                table.columns[i].value.borrow_mut().push_str(&text);
-                text.clear();
-                break;
-              }
+              };
+              table.write(&format!("{}", id));
+              table.columns[i].value.borrow_mut().clear();
+            }
+            else {
+              table.write(&table.columns[i].value.borrow());
+              table.columns[i].value.borrow_mut().clear();
             }
           }
-          else if gmltoewkb {
-            if gmlpos && ((tag == "/gml:pos") || (tag == "/gml:posList")) { gmlpos = false; }
-            for i in 0..table.columns.len() {
-              if path == table.columns[i].path {
-                gmltoewkb = false;
-                if !gml_to_ewkb(&table.columns[i].value, &gmlcoll, table.columns[i].bbox.as_ref(), table.columns[i].multitype, &settings) {
-                  filtered = true;
-                }
-                gmlcoll.clear();
-                break;
-              }
-            }
+          table.write("\n");
+          if !state.tables.is_empty() {
+            state.table = state.tables.pop().unwrap();
+            return Step::Restart;
           }
-        },
-        Ok(Event::Eof) => break 'main,
-        Err(e) => fatalerr!("Error: failed to parse XML at position {}: {}", reader.buffer_position(), e),
-        _ => ()
+        }
       }
-      break; // By default we break out of the restart loop
-    }
-    buf.clear();
+      else if state.skipped && state.path == state.settings.skip {
+        state.skipped = false;
+        state.skipcount += 1;
+      }
+      let i = state.path.rfind('/').unwrap();
+      let tag = state.path.split_off(i);
+      if state.xmltotext {
+        state.text.push_str(&format!("<{}>", tag));
+        for i in 0..table.columns.len() {
+          if state.path == table.columns[i].path {
+            state.xmltotext = false;
+            if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
+              state.text = state.text.replace(s, r);
+            }
+            table.columns[i].value.borrow_mut().push_str(&state.text);
+            state.text.clear();
+            return Step::Next;
+          }
+        }
+      }
+      else if state.gmltoewkb {
+        if state.gmlpos && ((tag == "/gml:pos") || (tag == "/gml:posList")) { state.gmlpos = false; }
+        for i in 0..table.columns.len() {
+          if state.path == table.columns[i].path {
+            state.gmltoewkb = false;
+            if !gml_to_ewkb(&table.columns[i].value, &state.gmlcoll, table.columns[i].bbox.as_ref(), table.columns[i].multitype, &state.settings) {
+              state.filtered = true;
+            }
+            state.gmlcoll.clear();
+            return Step::Next;
+          }
+        }
+      }
+    },
+    Event::Eof => return Step::Done,
+    _ => ()
   }
-  if !settings.hush_info {
-    eprintln!("Info: [{}] {} rows processed in {} seconds{}{}",
-      maintable.name,
-      fullcount-filtercount-skipcount,
-      start.elapsed().as_secs(),
-      match filtercount { 0 => "".to_owned(), n => format!(" ({} excluded)", n) },
-      match skipcount { 0 => "".to_owned(), n => format!(" ({} skipped)", n) }
-    );
-  }
+
+  Step::Next
 }
 
 fn allow_iteration(column: &Column, settings: &Settings) -> bool {
