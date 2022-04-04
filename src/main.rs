@@ -15,14 +15,14 @@ use lazy_static::lazy_static;
 use cow_utils::CowUtils;
 
 macro_rules! fatalerr {
-    () => ({
-      eprintln!();
+  () => ({
+    eprintln!();
+    std::process::exit(1);
+  });
+  ($($arg:tt)*) => ({
+      eprintln!($($arg)*);
       std::process::exit(1);
-    });
-    ($($arg:tt)*) => ({
-        eprintln!($($arg)*);
-        std::process::exit(1);
-    });
+  });
 }
 
 struct Settings {
@@ -52,6 +52,7 @@ struct Table<'a> {
   path: String,
   file: RefCell<Box<dyn Write>>,
   columns: Vec<Column<'a>>,
+  lastid: RefCell<String>,
   domain: Box<Option<RefCell<Domain<'a>>>>,
   cardinality: Cardinality,
   emit_copyfrom: bool,
@@ -77,6 +78,7 @@ impl<'a> Table<'a> {
         ))
       },
       columns: Vec::new(),
+      lastid: RefCell::new(String::new()),
       domain: Box::new(None),
       cardinality,
       emit_copyfrom: if cardinality != Cardinality::None { settings.emit_copyfrom } else { false },
@@ -169,7 +171,9 @@ impl BBox {
 #[derive(PartialEq, Debug)]
 enum Step {
   Next,
-  Restart,
+  Repeat,
+  Defer,
+  Apply,
   Done
 }
 struct State<'a, 'b> {
@@ -180,6 +184,7 @@ struct State<'a, 'b> {
   rowpath: String,
   path: String,
   parentcol: Option<&'b Column<'a>>,
+  deferred: Option<String>,
   filtered: bool,
   skipped: bool,
   fullcount: u64,
@@ -512,6 +517,7 @@ fn main() {
     rowpath: rowpath.to_string(),
     path: String::new(),
     parentcol: None,
+    deferred: None,
     filtered: false,
     skipped: false,
     fullcount: 0,
@@ -527,14 +533,51 @@ fn main() {
   };
 
   let mut buf = Vec::new();
+  let mut deferred = Vec::new();
   let start = Instant::now();
   'main: loop { // Main loop over the XML nodes
     let event = state.reader.read_event(&mut buf).unwrap_or_else(|e| fatalerr!("Error: failed to parse XML at position {}: {}", state.reader.buffer_position(), e));
-    loop { // Restart loop to be able to process a node twice
+    loop { // Repeat loop to be able to process a node twice
       state.step = process_event(&event, &mut state);
       match state.step {
         Step::Next => break,
-        Step::Restart => continue,
+        Step::Repeat => {
+            // if !deferred.is_empty() { deferred.clear(); }
+            continue
+        },
+        Step::Defer => {
+          // println!("Defer {:?}", event);
+          deferred.push(event.into_owned());
+          break;
+        },
+        Step::Apply => {
+          if state.table.lastid.borrow().is_empty() {
+            fatalerr!("Subtable defer failed to yield a key for parent table");
+          }
+          // println!("Applying {} deferred events", deferred.len());
+          state.step = Step::Repeat;
+          state.path = state.deferred.unwrap();
+          state.deferred = None;
+          deferred.reverse();
+          let mut event = deferred.pop().expect("deferred array should never be empty at this stage");
+          loop {
+            // println!("Event: {:?}", event);
+            state.step = process_event(&event, &mut state);
+            match state.step {
+              Step::Repeat => continue,
+              Step::Defer => fatalerr!("Error: you have nested subtables that need non-linear processing; this is not currently supported"),
+              Step::Done => break 'main,
+              _ => ()
+            }
+            let result = deferred.pop();
+            if result.is_none() { break; }
+            event = result.unwrap();
+          }
+          state.path.clear();
+          let i = state.table.path.rfind('/').unwrap();
+          state.path.push_str(&state.table.path[0..i]);
+          break;
+        },
         Step::Done => break 'main
       }
     }
@@ -555,11 +598,24 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
   let table = &state.table;
   match event {
     Event::Start(ref e) => {
-      if state.step == Step::Next {
+      if state.step != Step::Repeat {
         state.path.push('/');
         state.path.push_str(state.reader.decode(e.name()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name()), err)));
       }
+      if let Some(path) = &state.deferred {
+        if state.path.starts_with(path) { return Step::Defer; }
+      }
       if state.filtered || state.skipped { return Step::Next; }
+      if !state.tables.is_empty() && state.path == table.path { // Start of a subtable
+        if table.cardinality != Cardinality::ManyToOne { // Subtable needs a foreign key from parent
+          if state.tables.last().unwrap().lastid.borrow().is_empty() {
+            if state.deferred.is_some() { fatalerr!("Error: you have multiple subtables that precede the parent table id column; this is not currently supported"); }
+            // println!("Defer subtable {}", table.name);
+            state.deferred = Some(state.path.clone());
+            return Step::Defer;
+          }
+        }
+      }
       if state.path == state.settings.skip {
         state.skipped = true;
         return Step::Next;
@@ -623,6 +679,7 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
         return Step::Next;
       }
       else if state.path.len() >= table.path.len() {
+        if state.path == table.path { state.table.lastid.borrow_mut().clear(); }
         if state.path == state.rowpath { state.fullcount += 1; }
         for i in 0..table.columns.len() {
           if state.path == table.columns[i].path { // This start tag matches one of the defined columns
@@ -632,7 +689,7 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
                 let id = serial.get()+1;
                 table.columns[i].value.borrow_mut().push_str(&id.to_string());
                 serial.set(id);
-                return Step::Restart; // Continue the restart loop because another column may also match the current path
+                return Step::Repeat; // Continue the repeat loop because another column may also match the current path
               }
             }
             // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
@@ -640,7 +697,7 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
               state.tables.push(table);
               state.parentcol = Some(&table.columns[i]);
               state.table = table.columns[i].subtable.as_ref().unwrap();
-              return Step::Restart; // Continue the restart loop because a subtable column may also match the current path
+              return Step::Repeat; // Continue the repeat loop because a subtable column may also match the current path
             }
             // Handle the 'attr' case where the content is read from an attribute of this tag
             if let Some(request) = table.columns[i].attr {
@@ -684,6 +741,9 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
       }
     },
     Event::Text(ref e) => {
+      if let Some(path) = &state.deferred {
+        if state.path.starts_with(path) { return Step::Defer; }
+      }
       if state.filtered || state.skipped { return Step::Next; }
       if state.xmltotext {
         state.text.push_str(&e.unescape_and_decode(&state.reader).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)));
@@ -718,11 +778,25 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
             let mut value = table.columns[i].value.borrow_mut();
             *value = value.replace(s, r);
           }
+          // println!("Table {} column {} value {}", table.name, table.columns[i].name, &table.columns[i].value.borrow());
+          if i == 0 {
+              table.lastid.borrow_mut().push_str(&table.columns[0].value.borrow());
+          }
           return Step::Next;
         }
       }
     },
     Event::End(_) => {
+      if let Some(path) = &state.deferred {
+        if state.path.starts_with(path) {
+          if state.path == table.path && !state.tables.is_empty() {
+            state.table = state.tables.pop().unwrap();
+          }
+          let i = state.path.rfind('/').unwrap();
+          state.path.truncate(i);
+          return Step::Defer;
+        }
+      }
       if state.path == table.path { // This is an end tag of the row path
         for i in 0..table.columns.len() {
           if let Some(re) = &table.columns[i].include {
@@ -742,22 +816,22 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
           if state.tables.is_empty() { state.filtercount += 1; } // Only count filtered for the main table
           else { // Subtable; nothing more to do in this case
             state.table = state.tables.pop().unwrap();
-            return Step::Restart;
+            return Step::Repeat;
           }
         }
         else {
           if !state.tables.is_empty() { // This is a subtable
             if table.cardinality != Cardinality::ManyToOne { // Write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
-              let key = state.tables.last().unwrap().columns[0].value.borrow();
+              let key = state.tables.last().unwrap().lastid.borrow();
               if key.is_empty() && !state.settings.hush_warning { println!("Warning: subtable {} has no foreign key for parent (you may need to add a 'seri' column)", table.name); }
               table.write(&format!("{}\t", key));
               let rowid;
               if let Some(domain) = table.domain.as_ref() {
                 let mut domain = domain.borrow_mut();
-                if !domain.map.contains_key(&table.columns[0].value.borrow().to_string()) {
+                if !domain.map.contains_key(&table.lastid.borrow().to_string()) {
                   domain.lastid += 1;
                   rowid = domain.lastid;
-                  domain.map.insert(table.columns[0].value.borrow().to_string(), rowid);
+                  domain.map.insert(table.lastid.borrow().to_string(), rowid);
                   if table.columns.len() == 1 {
                     domain.table.write(&format!("{}\t", rowid));
                   }
@@ -786,30 +860,30 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
                   }
                   domain.table.write("\n");
                 }
-                else { rowid = *domain.map.get(&table.columns[0].value.borrow().to_string()).unwrap(); }
+                else { rowid = *domain.map.get(&table.lastid.borrow().to_string()).unwrap(); }
                 if table.columns.len() == 1 { // Single column many-to-many subtable; needs the id from the domain map
                   table.write(&format!("{}" , rowid));
                 }
                 else {
-                  if table.columns[0].value.borrow().is_empty() { println!("Warning: subtable {} has no primary key to normalize on", table.name); }
-                  table.write(&format!("{}" , table.columns[0].value.borrow())); // This is a many-to-many relation; write the two keys into the link table
+                  if table.lastid.borrow().is_empty() { println!("Warning: subtable {} has no primary key to normalize on", table.name); }
+                  table.write(&format!("{}" , table.lastid.borrow())); // This is a many-to-many relation; write the two keys into the link table
                 }
                 table.write("\n");
                 table.clear_columns();
                 state.table = state.tables.pop().unwrap();
-                return Step::Restart;
+                return Step::Repeat;
               }
             }
-            else { // Normalized; write the id of this subtable into the parent table
-              state.parentcol.unwrap().value.borrow_mut().push_str(&table.columns[0].value.borrow());
+            else { // Many-to-one relation; write the id of this subtable into the parent table
+              state.parentcol.unwrap().value.borrow_mut().push_str(&table.lastid.borrow());
               if let Some(domain) = table.domain.as_ref() {
                 let mut domain = domain.borrow_mut();
-                if domain.map.contains_key(&table.columns[0].value.borrow().to_string()) {
+                if domain.map.contains_key(&table.lastid.borrow().to_string()) {
                   table.clear_columns();
                   state.table = state.tables.pop().unwrap();
-                  return Step::Restart;
+                  return Step::Repeat;
                 }
-                domain.map.insert(table.columns[0].value.borrow().to_string(), 0);
+                domain.map.insert(table.lastid.borrow().to_string(), 0);
                 // The for loop below will now write out the new row
               }
             }
@@ -844,18 +918,26 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
             }
           }
           table.write("\n");
-          if !state.tables.is_empty() {
+        }
+        if !state.tables.is_empty() {
             state.table = state.tables.pop().unwrap();
-            return Step::Restart;
-          }
+            return Step::Repeat;
         }
       }
       else if state.skipped && state.path == state.settings.skip {
         state.skipped = false;
         state.skipcount += 1;
       }
-      let i = state.path.rfind('/').unwrap();
+
+      if let Some(path) = &state.deferred {
+        if state.path == table.path && state.path.len() < path.len() { // We've just processed the deferred subtable's parent; apply the deferred events
+          return Step::Apply;
+        }
+      }
+
+      let i = state.path.rfind('/').expect("no slash in path; shouldn't happen");
       let tag = state.path.split_off(i);
+
       if state.xmltotext {
         state.text.push_str(&format!("<{}>", tag));
         for i in 0..table.columns.len() {
