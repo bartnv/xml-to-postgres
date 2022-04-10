@@ -710,10 +710,13 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
                           if !allow_iteration(&table.columns[i], &state.settings) { return Step::Next; }
                           if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
                         }
-                        table.columns[i].value.borrow_mut().push_str(value)
+                        if i == 0 { table.lastid.borrow_mut().push_str(value); }
+                        if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
+                          table.columns[i].value.borrow_mut().push_str(&value.replace(s, r));
+                        }
+                        else { table.columns[i].value.borrow_mut().push_str(value); }
                       }
                       else if !state.settings.hush_warning { eprintln!("Warning: failed to decode attribute {} for column {}", request, table.columns[i].name); }
-                      return Step::Next;
                     }
                   }
                   else if !state.settings.hush_warning { eprintln!("Warning: failed to decode an attribute for column {}", table.columns[i].name); }
@@ -723,10 +726,7 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
               if table.columns[i].value.borrow().is_empty() && !state.settings.hush_warning {
                 eprintln!("Warning: column {} requested attribute {} not found", table.columns[i].name, request);
               }
-              if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
-                let mut value = table.columns[i].value.borrow_mut();
-                *value = value.replace(s, r);
-              }
+              return Step::Next;
             }
             // Set the appropriate convert flag for the following data in case the 'conv' option is present
             match table.columns[i].convert {
