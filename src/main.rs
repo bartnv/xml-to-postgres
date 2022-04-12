@@ -689,9 +689,11 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
             if let Some(ref serial) = table.columns[i].serial {
               if table.columns[i].value.borrow().is_empty() {
                 let id = serial.get()+1;
-                table.columns[i].value.borrow_mut().push_str(&id.to_string());
+                let idstr = id.to_string();
+                table.columns[i].value.borrow_mut().push_str(&idstr);
+                table.lastid.borrow_mut().push_str(&idstr);
                 serial.set(id);
-                return Step::Repeat; // Continue the repeat loop because another column may also match the current path
+                continue;
               }
             }
             // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
