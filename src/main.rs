@@ -707,7 +707,7 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
                     if key == request {
                       if let Ok(value) = state.reader.decode(&attr.value) {
                         if !table.columns[i].value.borrow().is_empty() {
-                          if !allow_iteration(&table.columns[i], &state.settings) { return Step::Next; }
+                          if !allow_iteration(&table.columns[i], &state.settings) { break; }
                           if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
                         }
                         if i == 0 { table.lastid.borrow_mut().push_str(value); }
@@ -726,7 +726,7 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
               if table.columns[i].value.borrow().is_empty() && !state.settings.hush_warning {
                 eprintln!("Warning: column {} requested attribute {} not found", table.columns[i].name, request);
               }
-              return Step::Next;
+              continue;
             }
             // Set the appropriate convert flag for the following data in case the 'conv' option is present
             match table.columns[i].convert {
@@ -735,7 +735,6 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
               Some("gml-to-ewkb") => state.gmltoewkb = true,
               Some(_) => (),
             }
-            return Step::Next;
           }
         }
       }
@@ -760,7 +759,7 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
       }
       for i in 0..table.columns.len() {
         if state.path == table.columns[i].path {
-          if table.columns[i].attr.is_some() || table.columns[i].serial.is_some() { return Step::Next; }
+          if table.columns[i].attr.is_some() || table.columns[i].serial.is_some() { continue; }
           if !table.columns[i].value.borrow().is_empty() {
             if !allow_iteration(&table.columns[i], &state.settings) { return Step::Next; }
             if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
