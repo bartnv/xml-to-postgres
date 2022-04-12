@@ -584,10 +584,12 @@ fn main() {
     buf.clear();
   }
   if !state.settings.hush_info {
-    eprintln!("Info: [{}] {} rows processed in {} seconds{}{}",
+    let elapsed = start.elapsed().as_secs_f32();
+    eprintln!("Info: [{}] {} rows processed in {:.*} seconds{}{}",
       maintable.name,
       state.fullcount-state.filtercount-state.skipcount,
-      start.elapsed().as_secs(),
+      if elapsed > 9.9 { 0 } else if elapsed > 0.99 { 1 } else if elapsed > 0.099 { 2 } else { 3 },
+      elapsed,
       match state.filtercount { 0 => "".to_owned(), n => format!(" ({} excluded)", n) },
       match state.skipcount { 0 => "".to_owned(), n => format!(" ({} skipped)", n) }
     );
