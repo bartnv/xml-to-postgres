@@ -683,6 +683,8 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
       else if state.path.len() >= table.path.len() {
         if state.path == table.path { state.table.lastid.borrow_mut().clear(); }
         if state.path == state.rowpath { state.fullcount += 1; }
+        let mut subtable = None;
+
         for i in 0..table.columns.len() {
           if state.path == table.columns[i].path { // This start tag matches one of the defined columns
             // Handle the 'seri' case where this column is a virtual auto-incrementing serial
@@ -698,10 +700,8 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
             }
             // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
             if table.columns[i].subtable.is_some() {
-              state.tables.push(table);
-              state.parentcol = Some(&table.columns[i]);
-              state.table = table.columns[i].subtable.as_ref().unwrap();
-              return Step::Repeat; // Continue the repeat loop because a subtable column may also match the current path
+                if subtable.is_some() { fatalerr!("Error: multiple subtables starting from the same element is not supported"); }
+                subtable = Some(i);
             }
             // Handle the 'attr' case where the content is read from an attribute of this tag
             if let Some(request) = table.columns[i].attr {
@@ -740,6 +740,12 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
               Some(_) => (),
             }
           }
+        }
+        if let Some(i) = subtable {
+            state.tables.push(table);
+            state.parentcol = Some(&table.columns[i]);
+            state.table = table.columns[i].subtable.as_ref().unwrap();
+            return Step::Repeat; // Continue the repeat loop because a subtable column may also match the current path
         }
       }
     },
