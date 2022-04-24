@@ -689,6 +689,7 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
           if state.path == table.columns[i].path { // This start tag matches one of the defined columns
             // Handle the 'seri' case where this column is a virtual auto-incrementing serial
             if let Some(ref serial) = table.columns[i].serial {
+              // if table.cardinality == Cardinality::ManyToOne { continue; }
               if table.columns[i].value.borrow().is_empty() {
                 let id = serial.get()+1;
                 let idstr = id.to_string();
@@ -837,10 +838,14 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
               let rowid;
               if let Some(domain) = table.domain.as_ref() {
                 let mut domain = domain.borrow_mut();
-                if !domain.map.contains_key(&table.lastid.borrow().to_string()) {
+                let key = match table.columns[0].serial {
+                    Some(_) => table.columns[1..].iter().map(|c| c.value.borrow().to_string()).collect::<String>(),
+                    None => table.lastid.borrow().to_string()
+                };
+                if !domain.map.contains_key(&key) {
                   domain.lastid += 1;
                   rowid = domain.lastid;
-                  domain.map.insert(table.lastid.borrow().to_string(), rowid);
+                  domain.map.insert(key, rowid);
                   if table.columns.len() == 1 {
                     domain.table.write(&format!("{}\t", rowid));
                   }
@@ -869,7 +874,7 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
                   }
                   domain.table.write("\n");
                 }
-                else { rowid = *domain.map.get(&table.lastid.borrow().to_string()).unwrap(); }
+                else { rowid = *domain.map.get(&key).unwrap(); }
                 if table.columns.len() == 1 { // Single column many-to-many subtable; needs the id from the domain map
                   table.write(&format!("{}" , rowid));
                 }
@@ -884,16 +889,31 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
               }
             }
             else { // Many-to-one relation; write the id of this subtable into the parent table
-              state.parentcol.unwrap().value.borrow_mut().push_str(&table.lastid.borrow());
               if let Some(domain) = table.domain.as_ref() {
                 let mut domain = domain.borrow_mut();
-                if domain.map.contains_key(&table.lastid.borrow().to_string()) {
+                let key = match table.columns[0].serial {
+                    Some(_) => table.columns[1..].iter().map(|c| c.value.borrow().to_string()).collect::<String>(),
+                    None => table.lastid.borrow().to_string()
+                };
+                if domain.map.contains_key(&key) {
+                  if table.columns[0].serial.is_some() {
+                    state.parentcol.unwrap().value.borrow_mut().push_str(&format!("{}", *domain.map.get(&key).unwrap()));
+                  }
+                  else { state.parentcol.unwrap().value.borrow_mut().push_str(&table.lastid.borrow()); }
                   table.clear_columns();
                   state.table = state.tables.pop().unwrap();
                   return Step::Repeat;
                 }
-                domain.map.insert(table.lastid.borrow().to_string(), 0);
+                domain.lastid += 1;
+                let id = domain.lastid;
+                domain.map.insert(key, id);
                 // The for loop below will now write out the new row
+              }
+              if state.parentcol.unwrap().value.borrow().is_empty() {
+                state.parentcol.unwrap().value.borrow_mut().push_str(&table.lastid.borrow());
+              }
+              else if allow_iteration(state.parentcol.unwrap(), &state.settings) {
+                // TODO: make it do something...
               }
             }
           }
