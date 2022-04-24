@@ -13,6 +13,7 @@ use yaml_rust::yaml::Yaml;
 use regex::Regex;
 use lazy_static::lazy_static;
 use cow_utils::CowUtils;
+use git_version::git_describe;
 
 macro_rules! fatalerr {
   () => ({
@@ -470,7 +471,10 @@ fn main() {
   else if args.len() == 3 {
     bufread = Box::new(BufReader::new(File::open(&args[2]).unwrap_or_else(|err| fatalerr!("Error: failed to open input file '{}': {}", args[2], err))));
   }
-  else { fatalerr!("Usage: {} <configfile> [xmlfile]", args[0]); }
+  else {
+    eprintln!("xml-to-postgres {}", git_describe!("--tags"));
+    fatalerr!("Usage: {} <configfile> [xmlfile]", args[0]);
+  }
 
   let config = {
     let mut config_str = String::new();
