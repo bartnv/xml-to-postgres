@@ -1,5 +1,6 @@
 use std::io::{Read, Write, BufReader, BufRead, stdin, stdout};
 use std::fs::{File, OpenOptions};
+use std::mem;
 use std::path::Path;
 use std::env;
 use std::cell::{ Cell, RefCell };
@@ -288,6 +289,8 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       _ => None
     };
     let mut datatype = col["type"].as_str().unwrap_or("text").to_string();
+    let mut include: Option<Regex> = col["incl"].as_str().map(|str| Regex::new(str).unwrap_or_else(|err| fatalerr!("Error: invalid regex in 'incl' entry in configuration file: {}", err)));
+    let mut exclude: Option<Regex> = col["excl"].as_str().map(|str| Regex::new(str).unwrap_or_else(|err| fatalerr!("Error: invalid regex in 'excl' entry in configuration file: {}", err)));
     let norm = col["norm"].as_str();
     let file = col["file"].as_str();
     let cardinality = match (file, norm) { // The combination of 'file' and 'norm' options determine relation to the subtable (if any)
@@ -302,7 +305,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
           let filename = col["file"].as_str().unwrap();
           if table.columns.is_empty() { fatalerr!("Error: table '{}' cannot have a subtable as first column", name); }
           let mut subtable = add_table(colname, &path, Some(filename), settings, &[], cardinality);
-          subtable.columns.push(Column { name: colname.to_string(), path: path.clone(), datatype: datatype.to_string(), ..Default::default() });
+          subtable.columns.push(Column { name: colname.to_string(), path: path.clone(), datatype: datatype.to_string(), include: mem::take(&mut include), exclude: mem::take(&mut exclude), ..Default::default() });
           emit_preamble(&subtable, settings, Some(format!("{} {}", name, table.columns[0].datatype)));
           Some(subtable)
         },
@@ -311,7 +314,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
           if table.columns.is_empty() { fatalerr!("Error: table '{}' cannot have a subtable as first column", name); }
           let mut subtable = add_table(colname, &path, Some(filename), settings, &[], cardinality);
 //          subtable.columns.push(Column { name: String::from("id"), path: String::new(), datatype: String::from("integer"), ..Default::default() });
-          subtable.columns.push(Column { name: colname.to_string(), path: path.clone(), datatype: "integer".to_string(), ..Default::default() });
+          subtable.columns.push(Column { name: colname.to_string(), path: path.clone(), datatype: "integer".to_string(), include: mem::take(&mut include), exclude: mem::take(&mut exclude), ..Default::default() });
           emit_preamble(&subtable, settings, Some(format!("{} {}", name, table.columns[0].datatype)));
           Some(subtable)
         },
@@ -340,8 +343,6 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       }
     };
     let hide = col["hide"].as_bool().unwrap_or(false);
-    let include: Option<Regex> = col["incl"].as_str().map(|str| Regex::new(str).unwrap_or_else(|err| fatalerr!("Error: invalid regex in 'incl' entry in configuration file: {}", err)));
-    let exclude: Option<Regex> = col["excl"].as_str().map(|str| Regex::new(str).unwrap_or_else(|err| fatalerr!("Error: invalid regex in 'excl' entry in configuration file: {}", err)));
     let trim = col["trim"].as_bool().unwrap_or(false);
     let attr = col["attr"].as_str();
     let convert = col["conv"].as_str();
