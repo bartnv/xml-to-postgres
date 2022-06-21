@@ -137,7 +137,8 @@ struct Column<'a> {
   subtable: Option<Table<'a>>,
   domain: Option<RefCell<Domain<'a>>>,
   bbox: Option<BBox>,
-  multitype: bool
+  multitype: bool,
+  used: RefCell<bool>
 }
 
 #[derive(Debug)]
@@ -412,7 +413,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       eprintln!("Warning: the bbox option has no function without conversion type 'gml-to-ekwb'");
     }
 
-    let column = Column { name: colname.to_string(), path, serial, datatype, value: RefCell::new(String::new()), attr, hide, include, exclude, trim, convert, find, replace, aggr, subtable, domain, bbox, multitype };
+    let column = Column { name: colname.to_string(), path, serial, datatype, attr, hide, include, exclude, trim, convert, find, replace, aggr, subtable, domain, bbox, multitype, ..Default::default() };
     table.columns.push(column);
   }
 
@@ -588,6 +589,7 @@ fn main() {
     }
     buf.clear();
   }
+  if !state.settings.hush_warning { check_columns_used(&maintable); }
   if !state.settings.hush_info {
     let elapsed = start.elapsed().as_secs_f32();
     eprintln!("Info: [{}] {} rows processed in {:.*} seconds{}{}",
@@ -598,6 +600,18 @@ fn main() {
       match state.filtercount { 0 => "".to_owned(), n => format!(" ({} excluded)", n) },
       match state.skipcount { 0 => "".to_owned(), n => format!(" ({} skipped)", n) }
     );
+  }
+}
+
+fn check_columns_used(table: &Table) {
+  for col in &table.columns {
+    if col.subtable.is_some() {
+      let sub = col.subtable.as_ref().unwrap();
+      check_columns_used(sub);
+    }
+    else if !*col.used.borrow() {
+      eprintln!("Warning: table {} column {} was never found", table.name, col.name);
+    }
   }
 }
 
@@ -814,6 +828,9 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
       }
       if state.path == table.path { // This is an end tag of the row path
         for i in 0..table.columns.len() {
+          if !*table.columns[i].used.borrow() && !table.columns[i].value.borrow().is_empty() {
+              *state.table.columns[i].used.borrow_mut() = true;
+          }
           if let Some(re) = &table.columns[i].include {
             if !re.is_match(&table.columns[i].value.borrow()) {
               state.filtered = true;
