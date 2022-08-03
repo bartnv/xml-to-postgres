@@ -392,6 +392,9 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       if val == "gml-to-ewkb" && !settings.hush_notice {
         eprintln!("Notice: gml-to-ewkb conversion is experimental and in no way complete or standards compliant; use at your own risk");
       }
+      if col["type"].is_badvalue() { // Set datatype unless overridden
+        if val == "gml-to-ewkb" { datatype = String::from("geometry"); }
+      }
     }
     if let Some(val) = aggr {
       if !vec!("first", "last", "append").contains(&val) {
