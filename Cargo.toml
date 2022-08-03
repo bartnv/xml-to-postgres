@@ -1,6 +1,6 @@
 [package]
 name = "xml-to-postgres"
-version = "1.3.1"
+version = "1.3.2"
 authors = ["Bart Noordervliet <bart@mmvi.nl>"]
 edition = "2021"
 description = "Fast converter from XML to PostgreSQL dump format"
