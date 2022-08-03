@@ -656,7 +656,10 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
               state.gmlcoll.push(Geometry::new(1));
               state.gmlcoll.last_mut().unwrap().rings.push(Vec::new());
             },
-            "gml:LineString" => state.gmlcoll.push(Geometry::new(2)),
+            "gml:LineString" => {
+              state.gmlcoll.push(Geometry::new(2));
+              state.gmlcoll.last_mut().unwrap().rings.push(Vec::new());
+            },
             "gml:Polygon" => state.gmlcoll.push(Geometry::new(3)),
             "gml:MultiPolygon" => (),
             "gml:polygonMember" => (),
