@@ -73,8 +73,8 @@ impl<'a> Table<'a> {
         None => RefCell::new(Box::new(stdout())),
         Some(ref file) => RefCell::new(Box::new(
           match settings.filemode.as_ref() {
-            "truncate" => File::create(&Path::new(file)).unwrap_or_else(|err| fatalerr!("Error: failed to create output file '{}': {}", file, err)),
-            "append" => OpenOptions::new().append(true).create(true).open(&Path::new(file)).unwrap_or_else(|err| fatalerr!("Error: failed to open output file '{}': {}", file, err)),
+            "truncate" => File::create(Path::new(file)).unwrap_or_else(|err| fatalerr!("Error: failed to create output file '{}': {}", file, err)),
+            "append" => OpenOptions::new().append(true).create(true).open(Path::new(file)).unwrap_or_else(|err| fatalerr!("Error: failed to open output file '{}': {}", file, err)),
             mode => fatalerr!("Error: invalid 'mode' setting in configuration file: {}", mode)
           }
         ))
@@ -520,7 +520,7 @@ fn main() {
         .expand_empty_elements(true);
   let mut state = State {
     settings,
-    reader: reader,
+    reader,
     tables: Vec::new(),
     table: &maintable,
     rowpath: rowpath.to_string(),
