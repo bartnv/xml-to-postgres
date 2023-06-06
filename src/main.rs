@@ -1,10 +1,13 @@
 use std::io::{Read, Write, BufReader, BufRead, stdin, stdout};
 use std::fs::{File, OpenOptions};
 use std::mem;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::env;
 use std::cell::{ Cell, RefCell };
 use std::time::Instant;
+use std::sync::mpsc;
+use std::thread;
 use std::default::Default;
 use std::collections::HashMap;
 use quick_xml::Reader;
@@ -52,7 +55,9 @@ enum Cardinality {
 struct Table<'a> {
   name: String,
   path: String,
-  file: RefCell<Box<dyn Write>>,
+  buf: RefCell<String>,
+  writer_channel: mpsc::SyncSender<String>,
+  writer_thread: Option<thread::JoinHandle<()>>,
   columns: Vec<Column<'a>>,
   lastid: RefCell<String>,
   domain: Box<Option<RefCell<Domain<'a>>>>,
@@ -63,22 +68,27 @@ struct Table<'a> {
 impl<'a> Table<'a> {
   fn new(name: &str, path: &str, file: Option<&str>, settings: &Settings, cardinality: Cardinality) -> Table<'a> {
     //println!("Table {} path {} file {:?} cardinality {:?}", name, path, file, cardinality);
+    let out: RefCell<Box<dyn Write + Send>> = match file {
+      None => RefCell::new(Box::new(stdout())),
+      Some(ref file) => RefCell::new(Box::new(
+        match settings.filemode.as_ref() {
+          "truncate" => File::create(Path::new(file)).unwrap_or_else(|err| fatalerr!("Error: failed to create output file '{}': {}", file, err)),
+          "append" => OpenOptions::new().append(true).create(true).open(Path::new(file)).unwrap_or_else(|err| fatalerr!("Error: failed to open output file '{}': {}", file, err)),
+          mode => fatalerr!("Error: invalid 'mode' setting in configuration file: {}", mode)
+        }
+      ))
+    };
+    let (writer_channel, rx) = mpsc::sync_channel(100);
+    let writer_thread = thread::spawn(move || write_output(out, rx));
     let mut ownpath = String::from(path);
     if !ownpath.is_empty() && !ownpath.starts_with('/') { ownpath.insert(0, '/'); }
     if ownpath.ends_with('/') { ownpath.pop(); }
     Table {
       name: name.to_owned(),
       path: ownpath,
-      file: match file {
-        None => RefCell::new(Box::new(stdout())),
-        Some(ref file) => RefCell::new(Box::new(
-          match settings.filemode.as_ref() {
-            "truncate" => File::create(Path::new(file)).unwrap_or_else(|err| fatalerr!("Error: failed to create output file '{}': {}", file, err)),
-            "append" => OpenOptions::new().append(true).create(true).open(Path::new(file)).unwrap_or_else(|err| fatalerr!("Error: failed to open output file '{}': {}", file, err)),
-            mode => fatalerr!("Error: invalid 'mode' setting in configuration file: {}", mode)
-          }
-        ))
-      },
+      buf: RefCell::new(String::new()),
+      writer_channel,
+      writer_thread: Some(writer_thread),
       columns: Vec::new(),
       lastid: RefCell::new(String::new()),
       domain: Box::new(None),
@@ -87,8 +97,8 @@ impl<'a> Table<'a> {
       emit_starttransaction: if cardinality != Cardinality::None { settings.emit_starttransaction } else { false }
     }
   }
-  fn write(&self, text: &str) {
-    self.file.borrow_mut().write_all(text.as_bytes()).unwrap_or_else(|err| fatalerr!("Error: IO error encountered while writing table: {}", err));
+  fn flush(&self) {
+    if self.buf.borrow().len() > 0 { self.writer_channel.send(std::mem::take(&mut self.buf.borrow_mut())).unwrap(); }
   }
   fn clear_columns(&self) {
     for col in &self.columns {
@@ -98,8 +108,12 @@ impl<'a> Table<'a> {
 }
 impl<'a> Drop for Table<'a> {
   fn drop(&mut self) {
-    if self.emit_copyfrom { self.write("\\.\n"); }
-    if self.emit_starttransaction { self.write("COMMIT;\n"); }
+    if self.emit_copyfrom { write!(self.buf.borrow_mut(), "\\.\n").unwrap(); }
+    if self.emit_starttransaction { write!(self.buf.borrow_mut(), "COMMIT;\n").unwrap(); }
+    self.flush();
+    self.writer_channel.send(String::new()).unwrap(); // Terminates the writer thread
+    let thread = std::mem::take(&mut self.writer_thread);
+    thread.unwrap().join().unwrap_or_else(|_| eprintln!("Table writer thread for [{}] crashed", self.name));
   }
 }
 
@@ -424,15 +438,15 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
 }
 fn emit_preamble(table: &Table, settings: &Settings, fkey: Option<String>) {
   if settings.emit_starttransaction {
-    table.write("START TRANSACTION;\n");
+    write!(table.buf.borrow_mut(), "START TRANSACTION;\n").unwrap();
   }
   if settings.emit_droptable {
-    table.write(&format!("DROP TABLE IF EXISTS {};\n", table.name));
+    write!(table.buf.borrow_mut(), "DROP TABLE IF EXISTS {};\n", table.name).unwrap();
   }
   if settings.emit_createtable {
     if table.cardinality == Cardinality::ManyToMany {
       let fkey = fkey.as_ref().unwrap();
-      table.write(&format!("CREATE TABLE IF NOT EXISTS {}_{} ({}, {} {});\n", fkey.split_once(' ').unwrap().0, table.name, fkey, table.name, if table.columns.is_empty() { "integer" } else { &table.columns[0].datatype }));
+      write!(table.buf.borrow_mut(), "CREATE TABLE IF NOT EXISTS {}_{} ({}, {} {});\n", fkey.split_once(' ').unwrap().0, table.name, fkey, table.name, if table.columns.is_empty() { "integer" } else { &table.columns[0].datatype }).unwrap();
     }
     else {
       let mut cols = table.columns.iter().filter_map(|c| {
@@ -443,16 +457,16 @@ fn emit_preamble(table: &Table, settings: &Settings, fkey: Option<String>) {
         Some(spec)
       }).collect::<Vec<String>>().join(", ");
       if fkey.is_some() { cols.insert_str(0, &format!("{}, ", fkey.as_ref().unwrap())); }
-      table.write(&format!("CREATE TABLE IF NOT EXISTS {} ({});\n", table.name, cols));
+      write!(table.buf.borrow_mut(), "CREATE TABLE IF NOT EXISTS {} ({});\n", table.name, cols).unwrap();
     }
   }
   if settings.emit_truncate {
-    table.write(&format!("TRUNCATE {};\n", table.name));
+    write!(table.buf.borrow_mut(), "TRUNCATE {};\n", table.name).unwrap();
   }
   if settings.emit_copyfrom {
     if table.cardinality == Cardinality::ManyToMany {
       let parent = fkey.as_ref().unwrap().split_once(' ').unwrap().0;
-      table.write(&format!("COPY {}_{} ({}, {}) FROM stdin;\n", parent, table.name, parent, table.name));
+      write!(table.buf.borrow_mut(), "COPY {}_{} ({}, {}) FROM stdin;\n", parent, table.name, parent, table.name).unwrap();
     }
     else {
       let cols = table.columns.iter().filter_map(|c| {
@@ -460,11 +474,12 @@ fn emit_preamble(table: &Table, settings: &Settings, fkey: Option<String>) {
         Some(String::from(&c.name))
       }).collect::<Vec<String>>().join(", ");
       if fkey.is_some() {
-        table.write(&format!("COPY {} ({}, {}) FROM stdin;\n", table.name, fkey.unwrap().split(' ').next().unwrap(), cols));
+        write!(table.buf.borrow_mut(), "COPY {} ({}, {}) FROM stdin;\n", table.name, fkey.unwrap().split(' ').next().unwrap(), cols).unwrap();
       }
-      else { table.write(&format!("COPY {} ({}) FROM stdin;\n", table.name, cols)); }
+      else { write!(table.buf.borrow_mut(), "COPY {} ({}) FROM stdin;\n", table.name, cols).unwrap(); }
     }
   }
+  table.flush();
 }
 
 fn main() {
@@ -862,7 +877,7 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
             if table.cardinality != Cardinality::ManyToOne { // Write the first column value of the parent table as the first column of the subtable (for use as a foreign key)
               let key = state.tables.last().unwrap().lastid.borrow();
               if key.is_empty() && !state.settings.hush_warning { println!("Warning: subtable {} has no foreign key for parent (you may need to add a 'seri' column)", table.name); }
-              table.write(&format!("{}\t", key));
+              write!(table.buf.borrow_mut(), "{}\t", key).unwrap();
               let rowid;
               if let Some(domain) = table.domain.as_ref() {
                 let mut domain = domain.borrow_mut();
@@ -875,13 +890,13 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
                   rowid = domain.lastid;
                   domain.map.insert(key, rowid);
                   if table.columns.len() == 1 {
-                    domain.table.write(&format!("{}\t", rowid));
+                    write!(domain.table.buf.borrow_mut(), "{}\t", rowid).unwrap();
                   }
                   for i in 0..table.columns.len() {
                     if table.columns[i].subtable.is_some() { continue; }
                     if table.columns[i].hide { continue; }
-                    if i > 0 { domain.table.write("\t"); }
-                    if table.columns[i].value.borrow().is_empty() { domain.table.write("\\N"); }
+                    if i > 0 { write!(domain.table.buf.borrow_mut(), "\t").unwrap(); }
+                    if table.columns[i].value.borrow().is_empty() { write!(domain.table.buf.borrow_mut(), "\\N").unwrap(); }
                     else if let Some(domain) = table.columns[i].domain.as_ref() {
                       let mut domain = domain.borrow_mut();
                       let id = match domain.map.get(&table.columns[i].value.borrow().to_string()) {
@@ -890,27 +905,30 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
                           domain.lastid += 1;
                           let id = domain.lastid;
                           domain.map.insert(table.columns[i].value.borrow().to_string(), id);
-                          domain.table.write(&format!("{}\t{}\n", id, *table.columns[i].value.borrow()));
+                          write!(domain.table.buf.borrow_mut(), "{}\t{}\n", id, *table.columns[i].value.borrow()).unwrap();
+                          domain.table.flush();
                           id
                         }
                       };
-                      domain.table.write(&format!("{}", id));
+                      write!(domain.table.buf.borrow_mut(), "{}", id).unwrap();
                     }
                     else {
-                      domain.table.write(&table.columns[i].value.borrow());
+                      write!(domain.table.buf.borrow_mut(), "{}", &table.columns[i].value.borrow()).unwrap();
                     }
                   }
-                  domain.table.write("\n");
+                  write!(domain.table.buf.borrow_mut(), "\n").unwrap();
+                  domain.table.flush();
                 }
                 else { rowid = *domain.map.get(&key).unwrap(); }
                 if table.columns.len() == 1 { // Single column many-to-many subtable; needs the id from the domain map
-                  table.write(&format!("{}" , rowid));
+                  write!(table.buf.borrow_mut(), "{}" , rowid).unwrap();
                 }
                 else {
                   if table.lastid.borrow().is_empty() { println!("Warning: subtable {} has no primary key to normalize on", table.name); }
-                  table.write(&format!("{}" , table.lastid.borrow())); // This is a many-to-many relation; write the two keys into the link table
+                  write!(table.buf.borrow_mut(), "{}" , table.lastid.borrow()).unwrap(); // This is a many-to-many relation; write the two keys into the link table
                 }
-                table.write("\n");
+                write!(table.buf.borrow_mut(), "\n").unwrap();
+                table.flush();
                 table.clear_columns();
                 state.table = state.tables.pop().unwrap();
                 return Step::Repeat;
@@ -952,8 +970,8 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
               table.columns[i].value.borrow_mut().clear();
               continue;
             }
-            if i > 0 { table.write("\t"); }
-            if table.columns[i].value.borrow().is_empty() { table.write("\\N"); }
+            if i > 0 { write!(table.buf.borrow_mut(), "\t").unwrap(); }
+            if table.columns[i].value.borrow().is_empty() { write!(table.buf.borrow_mut(), "\\N").unwrap(); }
             else if let Some(domain) = table.columns[i].domain.as_ref() {
               let mut domain = domain.borrow_mut();
               let id = match domain.map.get(&table.columns[i].value.borrow().to_string()) {
@@ -962,19 +980,21 @@ fn process_event(event: &Event, mut state: &mut State) -> Step {
                   domain.lastid += 1;
                   let id = domain.lastid;
                   domain.map.insert(table.columns[i].value.borrow().to_string(), id);
-                  domain.table.write(&format!("{}\t{}\n", id, *table.columns[i].value.borrow()));
+                  write!(domain.table.buf.borrow_mut(), "{}\t{}\n", id, *table.columns[i].value.borrow()).unwrap();
+                  domain.table.flush();
                   id
                 }
               };
-              table.write(&format!("{}", id));
+              write!(table.buf.borrow_mut(), "{}", id).unwrap();
               table.columns[i].value.borrow_mut().clear();
             }
             else {
-              table.write(&table.columns[i].value.borrow());
+              write!(table.buf.borrow_mut(), "{}", &table.columns[i].value.borrow()).unwrap();
               table.columns[i].value.borrow_mut().clear();
             }
           }
-          table.write("\n");
+          write!(table.buf.borrow_mut(), "\n").unwrap();
+          table.flush();
         }
         if !state.tables.is_empty() {
             state.table = state.tables.pop().unwrap();
@@ -1044,5 +1064,12 @@ fn allow_iteration(column: &Column, settings: &Settings) -> bool {
       true
     },
     _ => true
+  }
+}
+
+fn write_output(file: RefCell<Box<dyn Write>>, rx: mpsc::Receiver<String>) {
+  while let Ok(buf) = rx.recv() {
+    if buf.len() == 0 { break; }
+    file.borrow_mut().write_all(buf.as_bytes()).unwrap_or_else(|err| fatalerr!("Error: IO error encountered while writing table: {}", err))
   }
 }
