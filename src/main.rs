@@ -79,7 +79,7 @@ impl<'a> Table<'a> {
       ))
     };
     let (writer_channel, rx) = mpsc::sync_channel(100);
-    let writer_thread = thread::spawn(move || write_output(out, rx));
+    let writer_thread = thread::Builder::new().name(format!("write {}", name)).spawn(move || write_output(out, rx)).unwrap_or_else(|err| fatalerr!("Error: failed to create writer thread: {}", err));
     let mut ownpath = String::from(path);
     if !ownpath.is_empty() && !ownpath.starts_with('/') { ownpath.insert(0, '/'); }
     if ownpath.ends_with('/') { ownpath.pop(); }
