@@ -531,8 +531,8 @@ fn main() {
 
   let mut reader;
   reader = Reader::from_reader(bufread);
-  reader.trim_text(true)
-        .expand_empty_elements(true);
+  reader.config_mut().trim_text(true);
+  reader.config_mut().expand_empty_elements = true;
   let mut state = State {
     settings,
     reader,
@@ -633,7 +633,7 @@ fn check_columns_used(table: &Table) {
   }
 }
 
-fn process_event(event: &Event, mut state: &mut State) -> Step {
+fn process_event(event: &Event, state: &mut State) -> Step {
   let table = &state.table;
   match event {
     Event::Start(ref e) => {
