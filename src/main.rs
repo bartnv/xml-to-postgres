@@ -804,7 +804,7 @@ fn process_event(event: &Event, state: &mut State) -> Step {
         if state.gmlpos {
           let value = String::from(e.unescape().unwrap_or_else(|err| fatalerr!("Error: failed to decode XML gmlpos '{}': {}", String::from_utf8_lossy(e), err)));
           for pos in value.split(' ') {
-            state.gmlcoll.last_mut().unwrap().rings.last_mut().unwrap().push(fast_float::parse(pos).unwrap_or_else(|err| fatalerr!("Error: failed to parse GML pos '{}' into float: {}", pos, err)));
+            state.gmlcoll.last_mut().unwrap().rings.last_mut().unwrap().push(pos.parse::<f64>().unwrap_or_else(|err| fatalerr!("Error: failed to parse GML pos '{}' into float: {}", pos, err)));
           }
         }
         return Step::Next;
