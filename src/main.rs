@@ -301,7 +301,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     if path.ends_with('/') { path.pop(); }
     let serial = match col["seri"].as_bool() {
       Some(true) => {
-        if *col != colspec[0] { eprintln!("Notice: a 'seri' column usually needs to be the first column; {} in table {} is not", colname, table.name); }
+        if *col != colspec[0] && !settings.hush_warning { eprintln!("Warning: a 'seri' column usually needs to be the first column; {} in table {} is not", colname, table.name); }
         Some(Cell::new(0))
       },
       _ => None
@@ -960,7 +960,7 @@ fn process_event(event: &Event, state: &mut State) -> Step {
                   write!(table.buf.borrow_mut(), "{}" , rowid).unwrap();
                 }
                 else {
-                  if table.lastid.borrow().is_empty() { println!("Warning: subtable {} has no primary key to normalize on", table.name); }
+                  if table.lastid.borrow().is_empty() && !state.settings.hush_warning { println!("Warning: subtable {} has no primary key to normalize on", table.name); }
                   write!(table.buf.borrow_mut(), "{}" , table.lastid.borrow()).unwrap(); // This is a many-to-many relation; write the two keys into the link table
                 }
                 write!(table.buf.borrow_mut(), "\n").unwrap();
