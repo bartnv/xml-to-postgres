@@ -1,4 +1,4 @@
-use std::io::{Read, Write, BufReader, BufRead, stdin, stdout};
+use std::io::{stdin, stdout, BufRead, BufReader, IsTerminal as _, Read, Write};
 use std::fs::{File, OpenOptions};
 use std::mem;
 use std::fmt::Write as _;
@@ -41,7 +41,8 @@ struct Settings {
   emit_droptable: bool,
   hush_info: bool,
   hush_notice: bool,
-  hush_warning: bool
+  hush_warning: bool,
+  show_progress: bool
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -521,7 +522,8 @@ fn main() {
     emit_droptable: emit.contains("drop_table"),
     hush_info: hush.contains("info"),
     hush_notice: hush.contains("notice"),
-    hush_warning: hush.contains("warning")
+    hush_warning: hush.contains("warning"),
+    show_progress: config["prog"].as_bool().unwrap_or_else(|| std::io::stdout().is_terminal())
   };
 
   let maintable = add_table(name, rowpath, outfile, &settings, colspec, Cardinality::Default);
@@ -613,7 +615,8 @@ fn main() {
   if !state.settings.hush_warning { check_columns_used(&maintable); }
   if !state.settings.hush_info {
     let elapsed = start.elapsed().as_secs_f32();
-    eprintln!("Info: [{}] {} rows processed in {:.*} seconds{}{}",
+    eprintln!("{}Info: [{}] {} rows processed in {:.*} seconds{}{}",
+      match state.settings.show_progress { true => "\r", false => "" },
       maintable.name,
       state.fullcount-state.filtercount-state.skipcount,
       if elapsed > 9.9 { 0 } else if elapsed > 0.99 { 1 } else if elapsed > 0.099 { 2 } else { 3 },
@@ -731,6 +734,14 @@ fn process_event(event: &Event, state: &mut State) -> Step {
         if path_match(&state.path, &table.path) { state.table.lastid.borrow_mut().clear(); }
         if path_match(&state.path, &state.rowpath) {
           state.fullcount += 1;
+          if state.settings.show_progress && !state.settings.hush_info && state.fullcount%100000 == 0 {
+            eprint!("\rInfo: [{}] {} rows processed{}{}",
+              table.name,
+              state.fullcount-state.filtercount-state.skipcount,
+              match state.filtercount { 0 => "".to_owned(), n => format!(" ({} excluded)", n) },
+              match state.skipcount { 0 => "".to_owned(), n => format!(" ({} skipped)", n) }
+            );
+          }
         }
         let mut subtable = None;
 
