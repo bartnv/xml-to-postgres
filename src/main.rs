@@ -17,7 +17,7 @@ use yaml_rust2::yaml::Yaml;
 use regex::Regex;
 use lazy_static::lazy_static;
 use cow_utils::CowUtils;
-use git_version::git_describe;
+use git_version::git_version;
 
 macro_rules! fatalerr {
   () => ({
@@ -492,7 +492,7 @@ fn main() {
     bufread = Box::new(BufReader::new(File::open(&args[2]).unwrap_or_else(|err| fatalerr!("Error: failed to open input file '{}': {}", args[2], err))));
   }
   else {
-    eprintln!("xml-to-postgres {}", git_describe!("--tags"));
+    eprintln!("xml-to-postgres {}", git_version!(args = ["--always", "--tags", "--dirty=-modified"]));
     fatalerr!("Usage: {} <configfile> [xmlfile]", args[0]);
   }
 
