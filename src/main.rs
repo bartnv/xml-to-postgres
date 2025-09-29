@@ -208,6 +208,7 @@ struct State<'a, 'b> {
   fullcount: u64,
   filtercount: u64,
   skipcount: u64,
+  concattext: bool,
   xmltotext: bool,
   text: String,
   gmltoewkb: bool,
@@ -401,7 +402,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     let multitype = col["mult"].as_bool().unwrap_or(false);
 
     if let Some(val) = convert {
-      if !vec!("xml-to-text", "gml-to-ewkb").contains(&val) {
+      if !vec!("xml-to-text", "gml-to-ewkb", "concat-text").contains(&val) {
         fatalerr!("Error: table '{}' option 'conv' contains invalid value: {}", name, val);
       }
       if val == "gml-to-ewkb" && !settings.hush_notice {
@@ -548,6 +549,7 @@ fn main() {
     fullcount: 0,
     filtercount: 0,
     skipcount: 0,
+    concattext: false,
     xmltotext: false,
     text: String::new(),
     gmltoewkb: false,
@@ -658,6 +660,9 @@ fn process_event(event: &Event, state: &mut State) -> Step {
       }
       if path_match(&state.path, &state.settings.skip) {
         state.skipped = true;
+        return Step::Next;
+      }
+      else if state.concattext {
         return Step::Next;
       }
       else if state.xmltotext {
@@ -782,6 +787,7 @@ fn process_event(event: &Event, state: &mut State) -> Step {
               None => (),
               Some("xml-to-text") => state.xmltotext = true,
               Some("gml-to-ewkb") => state.gmltoewkb = true,
+              Some("concat-text") => state.concattext = true,
               Some(_) => (),
             }
           }
@@ -799,7 +805,12 @@ fn process_event(event: &Event, state: &mut State) -> Step {
         if state.path.starts_with(path) { return Step::Defer; }
       }
       if state.filtered || state.skipped { return Step::Next; }
-      if state.xmltotext {
+      if state.concattext {
+        if !state.text.is_empty() { state.text.push(' '); }
+        state.text.push_str(&e.unescape().unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)));
+        return Step::Next;
+      }
+      else if state.xmltotext {
         state.text.push_str(&e.unescape().unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)));
         return Step::Next;
       }
@@ -850,6 +861,17 @@ fn process_event(event: &Event, state: &mut State) -> Step {
           return Step::Defer;
         }
       }
+
+      if state.concattext {
+        for i in 0..table.columns.len() {
+          if path_match(&state.path, &table.columns[i].path) {
+            state.concattext = false;
+            table.columns[i].value.borrow_mut().push_str(&state.text);
+            state.text.clear();
+          }
+        }
+      }
+
       if path_match(&state.path, &table.path) { // This is an end tag of the row path
         for i in 0..table.columns.len() {
           if !*table.columns[i].used.borrow() && !table.columns[i].value.borrow().is_empty() {
