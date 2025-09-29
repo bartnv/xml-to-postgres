@@ -144,10 +144,10 @@ struct Column<'a> {
   hide: bool,
   include: Option<Regex>,
   exclude: Option<Regex>,
+  find: Option<Regex>,
+  replace: Option<&'a str>,
   trim: bool,
   convert: Option<&'a str>,
-  find: Option<&'a str>,
-  replace: Option<&'a str>,
   aggr: Option<&'a str>,
   subtable: Option<Table<'a>>,
   domain: Option<RefCell<Domain<'a>>>,
@@ -362,7 +362,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
     let trim = col["trim"].as_bool().unwrap_or(false);
     let attr = col["attr"].as_str();
     let convert = col["conv"].as_str();
-    let find = col["find"].as_str();
+    let find = col["find"].as_str().map(|str| Regex::new(str).unwrap_or_else(|err| fatalerr!("Error: invalid regex in 'find' entry in configuration file: {}", err)));
     let replace = col["repl"].as_str();
     let aggr = col["aggr"].as_str();
     let domain = match norm {
@@ -760,8 +760,8 @@ fn process_event(event: &Event, state: &mut State) -> Step {
                           if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
                         }
                         if i == 0 { table.lastid.borrow_mut().push_str(&value); }
-                        if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
-                          table.columns[i].value.borrow_mut().push_str(&value.replace(s, r));
+                        if let (Some(regex), Some(replacer)) = (table.columns[i].find.as_ref(), table.columns[i].replace) {
+                          table.columns[i].value.borrow_mut().push_str(&regex.replace_all(&value, replacer));
                         }
                         else { table.columns[i].value.borrow_mut().push_str(&value); }
                       }
@@ -827,9 +827,9 @@ fn process_event(event: &Event, state: &mut State) -> Step {
           else {
             table.columns[i].value.borrow_mut().push_str(&decoded.cow_replace("\\", "\\\\").cow_replace("\r", "\\r").cow_replace("\n", "\\n").cow_replace("\t", "\\t"));
           }
-          if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
+          if let (Some(regex), Some(replacer)) = (table.columns[i].find.as_ref(), table.columns[i].replace) {
             let mut value = table.columns[i].value.borrow_mut();
-            *value = value.replace(s, r);
+            *value = regex.replace_all(&value, replacer).to_string();
           }
           // println!("Table {} column {} value {}", table.name, table.columns[i].name, &table.columns[i].value.borrow());
           if i == 0 {
@@ -1023,8 +1023,8 @@ fn process_event(event: &Event, state: &mut State) -> Step {
         for i in 0..table.columns.len() {
           if path_match(&state.path, &table.columns[i].path) {
             state.xmltotext = false;
-            if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
-              state.text = state.text.replace(s, r);
+            if let (Some(regex), Some(replacer)) = (table.columns[i].find.as_ref(), table.columns[i].replace) {
+              state.text = regex.replace_all(&state.text, replacer).to_string();
             }
             table.columns[i].value.borrow_mut().push_str(&state.text);
             state.text.clear();
