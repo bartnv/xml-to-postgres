@@ -18,6 +18,7 @@ use regex::Regex;
 use lazy_static::lazy_static;
 use cow_utils::CowUtils;
 use git_version::git_version;
+use glob_match::glob_match;
 
 macro_rules! fatalerr {
   () => ({
@@ -645,7 +646,7 @@ fn process_event(event: &Event, state: &mut State) -> Step {
         if state.path.starts_with(path) { return Step::Defer; }
       }
       if state.filtered || state.skipped { return Step::Next; }
-      if !state.tables.is_empty() && state.path == table.path { // Start of a subtable
+      if !state.tables.is_empty() && path_match(&state.path, &table.path) { // Start of a subtable
         if table.cardinality != Cardinality::ManyToOne { // Subtable needs a foreign key from parent
           if state.tables.last().unwrap().lastid.borrow().is_empty() {
             if state.deferred.is_some() { fatalerr!("Error: you have multiple subtables that precede the parent table id column; this is not currently supported"); }
@@ -655,7 +656,7 @@ fn process_event(event: &Event, state: &mut State) -> Step {
           }
         }
       }
-      if state.path == state.settings.skip {
+      if path_match(&state.path, &state.settings.skip) {
         state.skipped = true;
         return Step::Next;
       }
@@ -721,13 +722,15 @@ fn process_event(event: &Event, state: &mut State) -> Step {
         }
         return Step::Next;
       }
-      else if state.path.len() >= table.path.len() {
-        if state.path == table.path { state.table.lastid.borrow_mut().clear(); }
-        if state.path == state.rowpath { state.fullcount += 1; }
+      else if state.path.len() >= table.path.len() { // This optimization may need to go to properly support globbing everywhere
+        if path_match(&state.path, &table.path) { state.table.lastid.borrow_mut().clear(); }
+        if path_match(&state.path, &state.rowpath) {
+          state.fullcount += 1;
+        }
         let mut subtable = None;
 
         for i in 0..table.columns.len() {
-          if state.path == table.columns[i].path { // This start tag matches one of the defined columns
+          if path_match(&state.path, &table.columns[i].path) { // This start tag matches one of the defined columns
             // Handle the 'seri' case where this column is a virtual auto-incrementing serial
             if let Some(ref serial) = table.columns[i].serial {
               // if table.cardinality == Cardinality::ManyToOne { continue; }
@@ -810,7 +813,7 @@ fn process_event(event: &Event, state: &mut State) -> Step {
         return Step::Next;
       }
       for i in 0..table.columns.len() {
-        if state.path == table.columns[i].path {
+        if path_match(&state.path, &table.columns[i].path) {
           if table.columns[i].attr.is_some() || table.columns[i].serial.is_some() { continue; }
           if !table.columns[i].value.borrow().is_empty() {
             if !allow_iteration(&table.columns[i], &state.settings) { return Step::Next; }
@@ -839,7 +842,7 @@ fn process_event(event: &Event, state: &mut State) -> Step {
     Event::End(_) => {
       if let Some(path) = &state.deferred {
         if state.path.starts_with(path) {
-          if state.path == table.path && !state.tables.is_empty() {
+          if path_match(&state.path, &table.path) && !state.tables.is_empty() {
             state.table = state.tables.pop().unwrap();
           }
           let i = state.path.rfind('/').unwrap();
@@ -847,7 +850,7 @@ fn process_event(event: &Event, state: &mut State) -> Step {
           return Step::Defer;
         }
       }
-      if state.path == table.path { // This is an end tag of the row path
+      if path_match(&state.path, &table.path) { // This is an end tag of the row path
         for i in 0..table.columns.len() {
           if !*table.columns[i].used.borrow() && !table.columns[i].value.borrow().is_empty() {
               *state.table.columns[i].used.borrow_mut() = true;
@@ -1001,13 +1004,13 @@ fn process_event(event: &Event, state: &mut State) -> Step {
             return Step::Repeat;
         }
       }
-      else if state.skipped && state.path == state.settings.skip {
+      else if state.skipped && path_match(&state.path, &state.settings.skip) {
         state.skipped = false;
         state.skipcount += 1;
       }
 
       if let Some(path) = &state.deferred {
-        if state.path == table.path && state.path.len() < path.len() { // We've just processed the deferred subtable's parent; apply the deferred events
+        if path_match(&state.path, &table.path) && state.path.len() < path.len() { // We've just processed the deferred subtable's parent; apply the deferred events
           return Step::Apply;
         }
       }
@@ -1018,7 +1021,7 @@ fn process_event(event: &Event, state: &mut State) -> Step {
       if state.xmltotext {
         state.text.push_str(&format!("<{}>", tag));
         for i in 0..table.columns.len() {
-          if state.path == table.columns[i].path {
+          if path_match(&state.path, &table.columns[i].path) {
             state.xmltotext = false;
             if let (Some(s), Some(r)) = (table.columns[i].find, table.columns[i].replace) {
               state.text = state.text.replace(s, r);
@@ -1032,7 +1035,7 @@ fn process_event(event: &Event, state: &mut State) -> Step {
       else if state.gmltoewkb {
         if state.gmlpos && ((tag == "/gml:pos") || (tag == "/gml:posList")) { state.gmlpos = false; }
         for i in 0..table.columns.len() {
-          if state.path == table.columns[i].path {
+          if path_match(&state.path, &table.columns[i].path) {
             state.gmltoewkb = false;
             if !gml_to_ewkb(&table.columns[i].value, &state.gmlcoll, table.columns[i].bbox.as_ref(), table.columns[i].multitype, &state.settings) {
               state.filtered = true;
@@ -1048,6 +1051,11 @@ fn process_event(event: &Event, state: &mut State) -> Step {
   }
 
   Step::Next
+}
+
+fn path_match(path: &String, mask: &String) -> bool {
+  if !mask.contains("*") && !mask.contains("{") { return path == mask; }
+  glob_match(mask, path)
 }
 
 fn allow_iteration(column: &Column, settings: &Settings) -> bool {
