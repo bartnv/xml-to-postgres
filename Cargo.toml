@@ -8,8 +8,9 @@ publish = false
 
 [dependencies]
 quick-xml = "0"
-yaml-rust = "0.4"
+yaml-rust2 = "0"
 regex = "1"
 lazy_static = "1"
 cow-utils = "0.1"
 git-version = "0.3"
+glob-match = "0"
