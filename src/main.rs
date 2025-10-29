@@ -39,6 +39,7 @@ struct Settings {
   emit_starttransaction: bool,
   emit_truncate: bool,
   emit_droptable: bool,
+  hush_version: bool,
   hush_info: bool,
   hush_notice: bool,
   hush_warning: bool,
@@ -520,9 +521,10 @@ fn main() {
     emit_starttransaction: emit.contains("start_trans"),
     emit_truncate: emit.contains("truncate"),
     emit_droptable: emit.contains("drop_table"),
+    hush_version: hush.contains("version"),
     hush_info: hush.contains("info"),
     hush_notice: hush.contains("notice"),
-    hush_warning: hush.contains("warning"),
+    hush_warning: hush.contains("warn"),
     show_progress: config["prog"].as_bool().unwrap_or_else(|| std::io::stdout().is_terminal())
   };
 
@@ -642,6 +644,17 @@ fn check_columns_used(table: &Table) {
 fn process_event(event: &Event, state: &mut State) -> Step {
   let table = &state.table;
   match event {
+    Event::Decl(ref e) => {
+      if !state.settings.hush_version && !state.settings.hush_info {
+        eprintln!("Info: reading XML version {} with encoding {}",
+          str::from_utf8(&e.version().unwrap_or_else(|_| fatalerr!("Error: missing or invalid XML version attribute: {:#?}", e.as_ref()))).unwrap(),
+          str::from_utf8(match e.encoding() {
+            Some(Ok(Cow::Borrowed(encoding))) => encoding,
+            _ => b"unknown"
+          }).unwrap()
+        );
+      }
+    },
     Event::Start(ref e) => {
       if state.step != Step::Repeat {
         state.path.push('/');
