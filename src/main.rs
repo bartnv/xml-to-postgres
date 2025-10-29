@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{stdin, stdout, BufRead, BufReader, IsTerminal as _, Read, Write};
 use std::fs::{File, OpenOptions};
 use std::mem;
@@ -565,9 +566,23 @@ fn main() {
 
   let mut buf = Vec::new();
   let mut deferred = Vec::new();
+  let mut events = 0;
+  let mut report = 2;
   let start = Instant::now();
   'main: loop { // Main loop over the XML nodes
     let event = state.reader.read_event_into(&mut buf).unwrap_or_else(|e| fatalerr!("Error: failed to parse XML at position {}: {}", state.reader.buffer_position(), e));
+    if state.settings.show_progress && !state.settings.hush_info {
+      events += 1;
+      if events%10000 == 0 && start.elapsed().as_secs() > report {
+        report += 2;
+        eprint!("\rInfo: [{}] {} rows processed{}{}",
+          state.tables.first().unwrap_or(&state.table).name,
+          state.fullcount-state.filtercount-state.skipcount,
+          match state.filtercount { 0 => "".to_owned(), n => format!(" ({} excluded)", n) },
+          match state.skipcount { 0 => "".to_owned(), n => format!(" ({} skipped)", n) }
+        );
+      }
+    }
     loop { // Repeat loop to be able to process a node twice
       state.step = process_event(&event, &mut state);
       match state.step {
@@ -745,17 +760,7 @@ fn process_event(event: &Event, state: &mut State) -> Step {
       }
       else if state.path.len() >= table.path.len() { // This optimization may need to go to properly support globbing everywhere
         if path_match(&state.path, &table.path) { state.table.lastid.borrow_mut().clear(); }
-        if path_match(&state.path, &state.rowpath) {
-          state.fullcount += 1;
-          if state.settings.show_progress && !state.settings.hush_info && state.fullcount%100000 == 0 {
-            eprint!("\rInfo: [{}] {} rows processed{}{}",
-              table.name,
-              state.fullcount-state.filtercount-state.skipcount,
-              match state.filtercount { 0 => "".to_owned(), n => format!(" ({} excluded)", n) },
-              match state.skipcount { 0 => "".to_owned(), n => format!(" ({} skipped)", n) }
-            );
-          }
-        }
+        if path_match(&state.path, &state.rowpath) { state.fullcount += 1; }
         let mut subtable = None;
 
         for i in 0..table.columns.len() {
