@@ -758,75 +758,74 @@ fn process_event(event: &Event, state: &mut State) -> Step {
         }
         return Step::Next;
       }
-      else if state.path.len() >= table.path.len() { // This optimization may need to go to properly support globbing everywhere
-        if path_match(&state.path, &table.path) { state.table.lastid.borrow_mut().clear(); }
-        if path_match(&state.path, &state.rowpath) { state.fullcount += 1; }
-        let mut subtable = None;
 
-        for i in 0..table.columns.len() {
-          if path_match(&state.path, &table.columns[i].path) { // This start tag matches one of the defined columns
-            // Handle the 'seri' case where this column is a virtual auto-incrementing serial
-            if let Some(ref serial) = table.columns[i].serial {
-              // if table.cardinality == Cardinality::ManyToOne { continue; }
-              if table.columns[i].value.borrow().is_empty() {
-                let id = serial.get()+1;
-                let idstr = id.to_string();
-                table.columns[i].value.borrow_mut().push_str(&idstr);
-                table.lastid.borrow_mut().push_str(&idstr);
-                serial.set(id);
-                continue;
-              }
-            }
-            // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
-            if table.columns[i].subtable.is_some() {
-                if subtable.is_some() { fatalerr!("Error: multiple subtables starting from the same element is not supported"); }
-                subtable = Some(i);
-            }
-            // Handle the 'attr' case where the content is read from an attribute of this tag
-            if let Some(request) = table.columns[i].attr {
-              for res in e.attributes() {
-                if let Ok(attr) = res {
-                  if let Ok(key) = state.reader.decoder().decode(attr.key.as_ref()) {
-                    if key == request {
-                      if let Ok(value) = state.reader.decoder().decode(&attr.value) {
-                        if !table.columns[i].value.borrow().is_empty() {
-                          if !allow_iteration(&table.columns[i], &state.settings) { break; }
-                          if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
-                        }
-                        if i == 0 { table.lastid.borrow_mut().push_str(&value); }
-                        if let (Some(regex), Some(replacer)) = (table.columns[i].find.as_ref(), table.columns[i].replace) {
-                          table.columns[i].value.borrow_mut().push_str(&regex.replace_all(&value, replacer));
-                        }
-                        else { table.columns[i].value.borrow_mut().push_str(&value); }
-                      }
-                      else if !state.settings.hush_warning { eprintln!("Warning: failed to decode attribute {} for column {}", request, table.columns[i].name); }
-                    }
-                  }
-                  else if !state.settings.hush_warning { eprintln!("Warning: failed to decode an attribute for column {}", table.columns[i].name); }
-                }
-                else if !state.settings.hush_warning { eprintln!("Warning: failed to read attributes for column {}", table.columns[i].name); }
-              }
-              if table.columns[i].value.borrow().is_empty() && !state.settings.hush_warning {
-                eprintln!("Warning: column {} requested attribute {} not found", table.columns[i].name, request);
-              }
+      if path_match(&state.path, &table.path) { state.table.lastid.borrow_mut().clear(); }
+      if path_match(&state.path, &state.rowpath) { state.fullcount += 1; }
+      let mut subtable = None;
+
+      for i in 0..table.columns.len() {
+        if path_match(&state.path, &table.columns[i].path) { // This start tag matches one of the defined columns
+          // Handle the 'seri' case where this column is a virtual auto-incrementing serial
+          if let Some(ref serial) = table.columns[i].serial {
+            // if table.cardinality == Cardinality::ManyToOne { continue; }
+            if table.columns[i].value.borrow().is_empty() {
+              let id = serial.get()+1;
+              let idstr = id.to_string();
+              table.columns[i].value.borrow_mut().push_str(&idstr);
+              table.lastid.borrow_mut().push_str(&idstr);
+              serial.set(id);
               continue;
             }
-            // Set the appropriate convert flag for the following data in case the 'conv' option is present
-            match table.columns[i].convert {
-              None => (),
-              Some("xml-to-text") => state.xmltotext = true,
-              Some("gml-to-ewkb") => state.gmltoewkb = true,
-              Some("concat-text") => state.concattext = true,
-              Some(_) => (),
+          }
+          // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
+          if table.columns[i].subtable.is_some() {
+              if subtable.is_some() { fatalerr!("Error: multiple subtables starting from the same element is not supported"); }
+              subtable = Some(i);
+          }
+          // Handle the 'attr' case where the content is read from an attribute of this tag
+          if let Some(request) = table.columns[i].attr {
+            for res in e.attributes() {
+              if let Ok(attr) = res {
+                if let Ok(key) = state.reader.decoder().decode(attr.key.as_ref()) {
+                  if key == request {
+                    if let Ok(value) = state.reader.decoder().decode(&attr.value) {
+                      if !table.columns[i].value.borrow().is_empty() {
+                        if !allow_iteration(&table.columns[i], &state.settings) { break; }
+                        if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
+                      }
+                      if i == 0 { table.lastid.borrow_mut().push_str(&value); }
+                      if let (Some(regex), Some(replacer)) = (table.columns[i].find.as_ref(), table.columns[i].replace) {
+                        table.columns[i].value.borrow_mut().push_str(&regex.replace_all(&value, replacer));
+                      }
+                      else { table.columns[i].value.borrow_mut().push_str(&value); }
+                    }
+                    else if !state.settings.hush_warning { eprintln!("Warning: failed to decode attribute {} for column {}", request, table.columns[i].name); }
+                  }
+                }
+                else if !state.settings.hush_warning { eprintln!("Warning: failed to decode an attribute for column {}", table.columns[i].name); }
+              }
+              else if !state.settings.hush_warning { eprintln!("Warning: failed to read attributes for column {}", table.columns[i].name); }
             }
+            if table.columns[i].value.borrow().is_empty() && !state.settings.hush_warning {
+              eprintln!("Warning: column {} requested attribute {} not found", table.columns[i].name, request);
+            }
+            continue;
+          }
+          // Set the appropriate convert flag for the following data in case the 'conv' option is present
+          match table.columns[i].convert {
+            None => (),
+            Some("xml-to-text") => state.xmltotext = true,
+            Some("gml-to-ewkb") => state.gmltoewkb = true,
+            Some("concat-text") => state.concattext = true,
+            Some(_) => (),
           }
         }
-        if let Some(i) = subtable {
-            state.tables.push(table);
-            state.parentcol = Some(&table.columns[i]);
-            state.table = table.columns[i].subtable.as_ref().unwrap();
-            return Step::Repeat; // Continue the repeat loop because a subtable column may also match the current path
-        }
+      }
+      if let Some(i) = subtable {
+          state.tables.push(table);
+          state.parentcol = Some(&table.columns[i]);
+          state.table = table.columns[i].subtable.as_ref().unwrap();
+          return Step::Repeat; // Continue the repeat loop because a subtable column may also match the current path
       }
     },
     Event::Text(ref e) => {
