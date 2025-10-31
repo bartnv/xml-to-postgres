@@ -141,6 +141,7 @@ struct Column<'a> {
   name: String,
   path: String,
   serial: Option<Cell<u64>>,
+  fkey: Option<(String, String)>,
   datatype: String,
   value: RefCell<String>,
   attr: Option<&'a str>,
@@ -293,10 +294,14 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
   let mut table = Table::new(name, rowpath, outfile, settings, cardinality);
   for col in colspec {
     let colname = col["name"].as_str().unwrap_or_else(|| fatalerr!("Error: column has no 'name' entry in configuration file"));
-    let colpath = match col["seri"].as_bool() {
-      Some(true) => "/",
-      _ => col["path"].as_str().unwrap_or_else(|| fatalerr!("Error: table '{}' column '{}' has no 'path' entry in configuration file", name, colname))
-    };
+    let fkey = col["fkey"].as_str().map(String::from).map(|v| { match v.split_once('.') {
+      Some((left, right)) => (left.to_string(), right.to_string()),
+      None => fatalerr!("Error: column {} option 'fkey' is invalid", colname)
+    }});
+    let colpath =
+      if let Some(true) = col["seri"].as_bool() { "/" }
+      else if fkey.is_some() { "/" }
+      else { col["path"].as_str().unwrap_or_else(|| fatalerr!("Error: table '{}' column '{}' has no 'path' entry in configuration file", name, colname)) };
     let mut path = String::from(&table.path);
     if !colpath.is_empty() && !colpath.starts_with('/') { path.push('/'); }
     path.push_str(colpath);
@@ -435,7 +440,7 @@ fn add_table<'a>(name: &str, rowpath: &str, outfile: Option<&str>, settings: &Se
       eprintln!("Warning: the bbox option has no function without conversion type 'gml-to-ekwb'");
     }
 
-    let column = Column { name: colname.to_string(), path, serial, datatype, attr, hide, include, exclude, trim, convert, find, replace, aggr, subtable, domain, bbox, multitype, ..Default::default() };
+    let column = Column { name: colname.to_string(), path, serial, fkey, datatype, attr, hide, include, exclude, trim, convert, find, replace, aggr, subtable, domain, bbox, multitype, ..Default::default() };
     table.columns.push(column);
   }
 
@@ -775,6 +780,22 @@ fn process_event(event: &Event, state: &mut State) -> Step {
               table.lastid.borrow_mut().push_str(&idstr);
               serial.set(id);
               continue;
+            }
+          }
+          // Handle the 'fkey' case where this column contains a prior value
+          if let Some(ref fkey) = table.columns[i].fkey {
+            if table.columns[i].value.borrow().is_empty() {
+              for parent in &state.tables {
+                if parent.name != fkey.0 { continue; }
+                for col in &parent.columns {
+                  if col.name == fkey.1 {
+                    // println!("Found fkey {}.{} with value {}", parent.name, col.name, col.value.borrow());
+                    let mut column = table.columns[i].value.borrow_mut();
+                    column.clear();
+                    column.push_str(&col.value.borrow());
+                  }
+                }
+              }
             }
           }
           // Handle 'subtable' case (the 'cols' entry has 'cols' of its own)
