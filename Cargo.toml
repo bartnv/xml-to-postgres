@@ -7,7 +7,7 @@ description = "Fast converter from XML to PostgreSQL dump format"
 publish = false
 
 [dependencies]
-quick-xml = "0"
+quick-xml = "0.37"
 yaml-rust2 = "0"
 regex = "1"
 lazy_static = "1"
