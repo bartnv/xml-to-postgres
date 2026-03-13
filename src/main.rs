@@ -12,7 +12,7 @@ use std::thread;
 use std::default::Default;
 use std::collections::HashMap;
 use quick_xml::Reader;
-use quick_xml::events::Event;
+use quick_xml::events::Event as XmlEvent;
 use yaml_rust2::YamlLoader;
 use yaml_rust2::yaml::Yaml;
 use regex::Regex;
@@ -190,13 +190,18 @@ impl BBox {
   }
 }
 
+enum Event {
+  Start((String, HashMap<String, String>)),
+  Value(String),
+  End
+}
+
 #[derive(PartialEq, Debug)]
 enum Step {
   Next,
   Repeat,
   Defer,
-  Apply,
-  Done
+  Apply
 }
 struct State<'a, 'b> {
   settings: Settings,
@@ -578,8 +583,47 @@ fn main() {
   let mut events = 0;
   let mut report = 2;
   let start = Instant::now();
-  'main: loop { // Main loop over the XML nodes
-    let event = state.reader.read_event_into(&mut buf).unwrap_or_else(|e| fatalerr!("Error: failed to parse XML at position {}: {}", state.reader.buffer_position(), e));
+  loop { // Main loop over the XML nodes
+    let xmlevent = state.reader.read_event_into(&mut buf).unwrap_or_else(|e| fatalerr!("Error: failed to parse XML at position {}: {}", state.reader.buffer_position(), e));
+    let event = match xmlevent {
+      XmlEvent::Decl(ref e) => {
+        if !state.settings.hush_version && !state.settings.hush_info {
+          eprintln!("Info: reading XML version {} with encoding {}",
+            str::from_utf8(&e.version().unwrap_or_else(|_| fatalerr!("Error: missing or invalid XML version attribute: {:#?}", e.as_ref()))).unwrap(),
+            str::from_utf8(match e.encoding() {
+              Some(Ok(Cow::Borrowed(encoding))) => encoding,
+              _ => b"unknown"
+            }).unwrap()
+          );
+        }
+        continue;
+      },
+      XmlEvent::Start(ref e) => {
+        let tag = state.reader.decoder().decode(e.name().as_ref()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name().as_ref()), err)).to_string();
+        let mut attributes = HashMap::new();
+        for res in e.attributes() {
+          match res {
+            Err(_) => (),
+            Ok(attr) => {
+              let key = state.reader.decoder().decode(attr.key.as_ref()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute name '{}': {}", String::from_utf8_lossy(e.name().as_ref()), err)).to_string();
+              let value = state.reader.decoder().decode(attr.value.as_ref()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute name '{}': {}", String::from_utf8_lossy(e.name().as_ref()), err)).to_string();
+              attributes.insert(key, value);
+            }
+          }
+        }
+        Event::Start((tag, attributes))
+      },
+      XmlEvent::Text(ref e) => {
+        let value = e.unescape().unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)).to_string();
+        Event::Value(value)
+      },
+      XmlEvent::End(_) => {
+        Event::End
+      }
+      XmlEvent::Eof => break,
+      _ => fatalerr!("Error: invalid event received from XML parser")
+    };
+
     if state.settings.show_progress && !state.settings.hush_info {
       events += 1;
       if events%10000 == 0 && start.elapsed().as_secs() > report {
@@ -592,6 +636,7 @@ fn main() {
         );
       }
     }
+
     loop { // Repeat loop to be able to process a node twice
       state.step = process_event(&event, &mut state);
       match state.step {
@@ -602,7 +647,7 @@ fn main() {
         },
         Step::Defer => {
           // println!("Defer {:?}", event);
-          deferred.push(event.into_owned());
+          deferred.push(event);
           break;
         },
         Step::Apply => {
@@ -621,7 +666,6 @@ fn main() {
             match state.step {
               Step::Repeat => continue,
               Step::Defer => fatalerr!("Error: you have nested subtables that need non-linear processing; this is not currently supported"),
-              Step::Done => break 'main,
               _ => ()
             }
             let result = deferred.pop();
@@ -632,12 +676,12 @@ fn main() {
           let i = state.table.path.rfind('/').unwrap();
           state.path.push_str(&state.table.path[0..i]);
           break;
-        },
-        Step::Done => break 'main
+        }
       }
     }
     buf.clear();
   }
+
   if !state.settings.hush_warning { check_columns_used(&maintable); }
   if !state.settings.hush_info {
     let elapsed = start.elapsed().as_secs_f32();
@@ -668,21 +712,10 @@ fn check_columns_used(table: &Table) {
 fn process_event(event: &Event, state: &mut State) -> Step {
   let table = &state.table;
   match event {
-    Event::Decl(ref e) => {
-      if !state.settings.hush_version && !state.settings.hush_info {
-        eprintln!("Info: reading XML version {} with encoding {}",
-          str::from_utf8(&e.version().unwrap_or_else(|_| fatalerr!("Error: missing or invalid XML version attribute: {:#?}", e.as_ref()))).unwrap(),
-          str::from_utf8(match e.encoding() {
-            Some(Ok(Cow::Borrowed(encoding))) => encoding,
-            _ => b"unknown"
-          }).unwrap()
-        );
-      }
-    },
-    Event::Start(ref e) => {
+    Event::Start((tag, attr)) => {
       if state.step != Step::Repeat {
         state.path.push('/');
-        state.path.push_str(&state.reader.decoder().decode(e.name().as_ref()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name().as_ref()), err)));
+        state.path.push_str(&tag);
       }
       if let Some(path) = &state.deferred {
         if state.path.starts_with(path) { return Step::Defer; }
@@ -706,63 +739,52 @@ fn process_event(event: &Event, state: &mut State) -> Step {
         return Step::Next;
       }
       else if state.xmltotext {
-        state.text.push_str(&format!("<{}>", state.reader.decoder().decode(e.name().as_ref()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name().as_ref()), err))));
+        state.text.push_str(&format!("<{}>", tag));
         return Step::Next;
       }
       else if state.gmltoewkb {
-        match state.reader.decoder().decode(e.name().as_ref()) {
-          Err(_) => (),
-          Ok(tag) => match tag.as_ref() {
-            "gml:Point" => {
-              state.gmlcoll.push(Geometry::new(1));
-              state.gmlcoll.last_mut().unwrap().rings.push(Vec::new());
-            },
-            "gml:LineString" => {
-              state.gmlcoll.push(Geometry::new(2));
-              state.gmlcoll.last_mut().unwrap().rings.push(Vec::new());
-            },
-            "gml:Polygon" => state.gmlcoll.push(Geometry::new(3)),
-            "gml:MultiPolygon" => (),
-            "gml:polygonMember" => (),
-            "gml:exterior" => (),
-            "gml:interior" => (),
-            "gml:LinearRing" => state.gmlcoll.last_mut().unwrap().rings.push(Vec::new()),
-            "gml:posList" => state.gmlpos = true,
-            "gml:pos" => state.gmlpos = true,
-            _ => if !state.settings.hush_warning { eprintln!("Warning: GML type {} not supported", tag); }
-          }
+        match tag.as_ref() {
+          "gml:Point" => {
+            state.gmlcoll.push(Geometry::new(1));
+            state.gmlcoll.last_mut().unwrap().rings.push(Vec::new());
+          },
+          "gml:LineString" => {
+            state.gmlcoll.push(Geometry::new(2));
+            state.gmlcoll.last_mut().unwrap().rings.push(Vec::new());
+          },
+          "gml:Polygon" => state.gmlcoll.push(Geometry::new(3)),
+          "gml:MultiPolygon" => (),
+          "gml:polygonMember" => (),
+          "gml:exterior" => (),
+          "gml:interior" => (),
+          "gml:LinearRing" => state.gmlcoll.last_mut().unwrap().rings.push(Vec::new()),
+          "gml:posList" => state.gmlpos = true,
+          "gml:pos" => state.gmlpos = true,
+          _ => if !state.settings.hush_warning { eprintln!("Warning: GML type {} not supported", tag); }
         }
-        for res in e.attributes() {
-          match res {
-            Err(_) => (),
-            Ok(attr) => {
-              let key = state.reader.decoder().decode(attr.key.as_ref());
-              if key.is_err() { continue; }
-              match key.unwrap().as_ref() {
-                "srsName" => {
-                  let mut value = String::from(state.reader.decoder().decode(&attr.value).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute '{}': {}", String::from_utf8_lossy(&attr.value), err)));
-                  if let Some(i) = value.rfind("::") {
-                    value = value.split_off(i+2);
-                  }
-                  match value.parse::<u32>() {
-                    Ok(int) => {
-                      if let Some(geom) = state.gmlcoll.last_mut() { geom.srid = int };
-                    },
-                    Err(_) => if !state.settings.hush_warning { eprintln!("Warning: invalid srsName {} in GML", value); }
-                  }
+        for (key, value) in attr {
+          let mut value = value.as_str();
+          match key.as_ref() {
+            "srsName" => {
+              if let Some(i) = value.rfind("::") {
+                value = &value[i+2..];
+              }
+              match value.parse::<u32>() {
+                Ok(int) => {
+                  if let Some(geom) = state.gmlcoll.last_mut() { geom.srid = int };
                 },
-                "srsDimension" => {
-                  let value = state.reader.decoder().decode(&attr.value).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute '{}': {}", String::from_utf8_lossy(&attr.value), err));
-                  match value.parse::<u8>() {
-                    Ok(int) => {
-                      if let Some(geom) = state.gmlcoll.last_mut() { geom.dims = int };
-                    },
-                    Err(_) => if !state.settings.hush_warning { eprintln!("Warning: invalid srsDimension {} in GML", value); }
-                  }
-                }
-                _ => ()
+                Err(_) => if !state.settings.hush_warning { eprintln!("Warning: invalid srsName {} in GML", value); }
+              }
+            },
+            "srsDimension" => {
+              match value.parse::<u8>() {
+                Ok(int) => {
+                  if let Some(geom) = state.gmlcoll.last_mut() { geom.dims = int };
+                },
+                Err(_) => if !state.settings.hush_warning { eprintln!("Warning: invalid srsDimension {} in GML", value); }
               }
             }
+            _ => ()
           }
         }
         return Step::Next;
@@ -809,27 +831,18 @@ fn process_event(event: &Event, state: &mut State) -> Step {
           }
           // Handle the 'attr' case where the content is read from an attribute of this tag
           if let Some(request) = table.columns[i].attr {
-            for res in e.attributes() {
-              if let Ok(attr) = res {
-                if let Ok(key) = state.reader.decoder().decode(attr.key.as_ref()) {
-                  if key == request {
-                    if let Ok(value) = state.reader.decoder().decode(&attr.value) {
-                      if !table.columns[i].value.borrow().is_empty() {
-                        if !allow_iteration(&table.columns[i], &state.settings) { break; }
-                        if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
-                      }
-                      if i == 0 { table.lastid.borrow_mut().push_str(&value); }
-                      if let (Some(regex), Some(replacer)) = (table.columns[i].find.as_ref(), table.columns[i].replace) {
-                        table.columns[i].value.borrow_mut().push_str(&regex.replace_all(&value, replacer));
-                      }
-                      else { table.columns[i].value.borrow_mut().push_str(&value); }
-                    }
-                    else if !state.settings.hush_warning { eprintln!("Warning: failed to decode attribute {} for column {}", request, table.columns[i].name); }
-                  }
+            for (key, value) in attr {
+              if key == request {
+                if !table.columns[i].value.borrow().is_empty() {
+                  if !allow_iteration(&table.columns[i], &state.settings) { break; }
+                  if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
                 }
-                else if !state.settings.hush_warning { eprintln!("Warning: failed to decode an attribute for column {}", table.columns[i].name); }
+                if i == 0 { table.lastid.borrow_mut().push_str(&value); }
+                if let (Some(regex), Some(replacer)) = (table.columns[i].find.as_ref(), table.columns[i].replace) {
+                  table.columns[i].value.borrow_mut().push_str(&regex.replace_all(&value, replacer));
+                }
+                else { table.columns[i].value.borrow_mut().push_str(&value); }
               }
-              else if !state.settings.hush_warning { eprintln!("Warning: failed to read attributes for column {}", table.columns[i].name); }
             }
             if table.columns[i].value.borrow().is_empty() && !state.settings.hush_warning {
               eprintln!("Warning: column {} requested attribute {} not found", table.columns[i].name, request);
@@ -853,23 +866,22 @@ fn process_event(event: &Event, state: &mut State) -> Step {
           return Step::Repeat; // Continue the repeat loop because a subtable column may also match the current path
       }
     },
-    Event::Text(ref e) => {
+    Event::Value(value) => {
       if let Some(path) = &state.deferred {
         if state.path.starts_with(path) { return Step::Defer; }
       }
       if state.filtered || state.skipped { return Step::Next; }
       if state.concattext {
         if !state.text.is_empty() { state.text.push(' '); }
-        state.text.push_str(&e.unescape().unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)));
+        state.text.push_str(&value);
         return Step::Next;
       }
       else if state.xmltotext {
-        state.text.push_str(&e.unescape().unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)));
+        state.text.push_str(&value);
         return Step::Next;
       }
       else if state.gmltoewkb {
         if state.gmlpos {
-          let value = String::from(e.unescape().unwrap_or_else(|err| fatalerr!("Error: failed to decode XML gmlpos '{}': {}", String::from_utf8_lossy(e), err)));
           for pos in value.split(' ') {
             state.gmlcoll.last_mut().unwrap().rings.last_mut().unwrap().push(pos.parse::<f64>().unwrap_or_else(|err| fatalerr!("Error: failed to parse GML pos '{}' into float: {}", pos, err)));
           }
@@ -883,13 +895,12 @@ fn process_event(event: &Event, state: &mut State) -> Step {
             if !allow_iteration(&table.columns[i], &state.settings) { return Step::Next; }
             if let Some("last") = table.columns[i].aggr { table.columns[i].value.borrow_mut().clear(); }
           }
-          let decoded = e.unescape().unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err));
           if table.columns[i].trim {
-            let trimmed = state.trimre.replace_all(&decoded, " ");
+            let trimmed = state.trimre.replace_all(&value, " ");
             table.columns[i].value.borrow_mut().push_str(&trimmed.cow_replace("\\", "\\\\").cow_replace("\t", "\\t"));
           }
           else {
-            table.columns[i].value.borrow_mut().push_str(&decoded.cow_replace("\\", "\\\\").cow_replace("\r", "\\r").cow_replace("\n", "\\n").cow_replace("\t", "\\t"));
+            table.columns[i].value.borrow_mut().push_str(&value.cow_replace("\\", "\\\\").cow_replace("\r", "\\r").cow_replace("\n", "\\n").cow_replace("\t", "\\t"));
           }
           if let (Some(regex), Some(replacer)) = (table.columns[i].find.as_ref(), table.columns[i].replace) {
             let mut value = table.columns[i].value.borrow_mut();
@@ -903,7 +914,7 @@ fn process_event(event: &Event, state: &mut State) -> Step {
         }
       }
     },
-    Event::End(_) => {
+    Event::End => {
       if let Some(path) = &state.deferred {
         if state.path.starts_with(path) {
           if path_match(&state.path, &table.path) && !state.tables.is_empty() {
@@ -1122,9 +1133,7 @@ fn process_event(event: &Event, state: &mut State) -> Step {
           }
         }
       }
-    },
-    Event::Eof => return Step::Done,
-    _ => ()
+    }
   }
 
   Step::Next
