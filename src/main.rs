@@ -1,17 +1,18 @@
 use std::borrow::Cow;
-use std::io::{stdin, stdout, BufRead, BufReader, IsTerminal as _, Read, Write};
+use std::io::{stdin, stdout, BufReader, IsTerminal as _, Read, Write};
 use std::fs::{File, OpenOptions};
 use std::mem;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::env;
 use std::cell::{ Cell, RefCell };
+use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 use std::sync::mpsc;
 use std::thread;
 use std::default::Default;
 use std::collections::HashMap;
-use quick_xml::Reader;
+use quick_xml::Reader as XmlParser;
 use quick_xml::events::Event as XmlEvent;
 use yaml_rust2::YamlLoader;
 use yaml_rust2::yaml::Yaml;
@@ -32,7 +33,15 @@ macro_rules! fatalerr {
   });
 }
 
+#[derive(Clone, PartialEq)]
+enum InputType {
+  Xml,
+  Json
+}
+
+#[derive(Clone)]
 struct Settings {
+  inputtype: InputType,
   filemode: String,
   skip: String,
   emit_copyfrom: bool,
@@ -205,7 +214,6 @@ enum Step {
 }
 struct State<'a, 'b> {
   settings: Settings,
-  reader: Reader<Box<dyn BufRead>>,
   tables: Vec<&'b Table<'a>>,
   table: &'b Table<'a>,
   rowpath: String,
@@ -503,17 +511,14 @@ fn emit_preamble(table: &Table, settings: &Settings, fkey: Option<String>) {
 
 fn main() {
   let args: Vec<_> = env::args().collect();
-  let bufread: Box<dyn BufRead>;
-  if args.len() == 2 {
-    bufread = Box::new(BufReader::new(stdin()));
-  }
-  else if args.len() == 3 {
-    bufread = Box::new(BufReader::new(File::open(&args[2]).unwrap_or_else(|err| fatalerr!("Error: failed to open input file '{}': {}", args[2], err))));
-  }
-  else {
-    eprintln!("xml-to-postgres {}", git_version!(args = ["--always", "--tags", "--dirty=-modified"]));
-    fatalerr!("Usage: {} <configfile> [xmlfile]", args[0]);
-  }
+  let inputfile = match args.len() {
+    2 => String::from("-"),
+    3 => args[2].to_string(),
+    _ => {
+      eprintln!("xml-to-postgres {}", git_version!(args = ["--always", "--tags", "--dirty=-modified"]));
+      fatalerr!("Usage: {} <configfile> [inputfile]", args[0]);
+    }
+  };
 
   let config = {
     let mut config_str = String::new();
@@ -529,6 +534,28 @@ fn main() {
   let emit = config["emit"].as_str().unwrap_or("");
   let hush = config["hush"].as_str().unwrap_or("");
   let mut settings = Settings {
+    inputtype: match config["type"].as_str() {
+      Some(str) => match str.to_lowercase().as_ref() {
+        "xml" => InputType::Xml,
+        "json" => InputType::Json,
+        _ => fatalerr!("Error: invalid 'type' entry in configuration file")
+      },
+      None => if args.len() == 3 {
+        if let Some(ext) = args[2].rsplit('.').next() {
+          match ext {
+            "xml" => InputType::Xml,
+            "json" => InputType::Json,
+            _ => fatalerr!("Error: no 'type' entry in configuration file and input type cannot be inferred")
+          }
+        }
+        else {
+          fatalerr!("Error: no 'type' entry in configuration file and input type cannot be inferred");
+        }
+      }
+      else {
+          fatalerr!("Error: no 'type' entry in configuration file and input type cannot be inferred");
+      }
+    },
     filemode: config["mode"].as_str().unwrap_or("truncate").to_owned(),
     skip: config["skip"].as_str().unwrap_or("").to_owned(),
     emit_copyfrom: emit.contains("copy_from") || emit.contains("create_table") || emit.contains("start_trans") || emit.contains("truncate") || emit.contains("drop_table"),
@@ -550,13 +577,8 @@ fn main() {
     settings.skip.insert_str(0, &maintable.path); // Maintable path is normalized in add_table()
   }
 
-  let mut reader;
-  reader = Reader::from_reader(bufread);
-  reader.config_mut().trim_text(true);
-  reader.config_mut().expand_empty_elements = true;
   let mut state = State {
     settings,
-    reader,
     tables: Vec::new(),
     table: &maintable,
     rowpath: rowpath.to_string(),
@@ -578,52 +600,20 @@ fn main() {
     trimre: Regex::new("[ \n\r\t]*\n[ \n\r\t]*").unwrap()
   };
 
-  let mut buf = Vec::new();
   let mut deferred = Vec::new();
   let mut events = 0;
   let mut report = 2;
   let start = Instant::now();
-  loop { // Main loop over the XML nodes
-    let xmlevent = state.reader.read_event_into(&mut buf).unwrap_or_else(|e| fatalerr!("Error: failed to parse XML at position {}: {}", state.reader.buffer_position(), e));
-    let event = match xmlevent {
-      XmlEvent::Decl(ref e) => {
-        if !state.settings.hush_version && !state.settings.hush_info {
-          eprintln!("Info: reading XML version {} with encoding {}",
-            str::from_utf8(&e.version().unwrap_or_else(|_| fatalerr!("Error: missing or invalid XML version attribute: {:#?}", e.as_ref()))).unwrap(),
-            str::from_utf8(match e.encoding() {
-              Some(Ok(Cow::Borrowed(encoding))) => encoding,
-              _ => b"unknown"
-            }).unwrap()
-          );
-        }
-        continue;
-      },
-      XmlEvent::Start(ref e) => {
-        let tag = state.reader.decoder().decode(e.name().as_ref()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name().as_ref()), err)).to_string();
-        let mut attributes = HashMap::new();
-        for res in e.attributes() {
-          match res {
-            Err(_) => (),
-            Ok(attr) => {
-              let key = state.reader.decoder().decode(attr.key.as_ref()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute name '{}': {}", String::from_utf8_lossy(e.name().as_ref()), err)).to_string();
-              let value = state.reader.decoder().decode(attr.value.as_ref()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute name '{}': {}", String::from_utf8_lossy(e.name().as_ref()), err)).to_string();
-              attributes.insert(key, value);
-            }
-          }
-        }
-        Event::Start((tag, attributes))
-      },
-      XmlEvent::Text(ref e) => {
-        let value = e.unescape().unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)).to_string();
-        Event::Value(value)
-      },
-      XmlEvent::End(_) => {
-        Event::End
-      }
-      XmlEvent::Eof => break,
-      _ => fatalerr!("Error: invalid event received from XML parser")
-    };
+  let (tx, rx) = mpsc::sync_channel(100);
+  let settings = state.settings.clone();
+  thread::Builder::new().name(format!("parse {}", name))
+    .spawn(move || generate_events(settings, inputfile, tx)).unwrap_or_else(|err| fatalerr!("Error: failed to create parser thread: {}", err));
 
+  loop { // Main loop over the XML nodes
+    let event = match rx.recv() {
+      Ok(event) => event,
+      Err(_) => break // Parser has finished
+    };
     if state.settings.show_progress && !state.settings.hush_info {
       events += 1;
       if events%10000 == 0 && start.elapsed().as_secs() > report {
@@ -679,7 +669,6 @@ fn main() {
         }
       }
     }
-    buf.clear();
   }
 
   if !state.settings.hush_warning { check_columns_used(&maintable); }
@@ -705,6 +694,63 @@ fn check_columns_used(table: &Table) {
     }
     else if !*col.used.borrow() {
       eprintln!("Warning: table {} column {} was never found", table.name, col.name);
+    }
+  }
+}
+
+fn generate_events(settings: Settings, inputfile: String, tx: SyncSender<Event>) {
+  let file: Box<dyn Read> = match inputfile.as_ref() {
+    "-" => Box::new(stdin()),
+    name => Box::new(File::open(name).unwrap_or_else(|err| fatalerr!("Error: failed to open input file '{}': {}", name, err)))
+  };
+  if settings.inputtype == InputType::Xml {
+    let mut buf = Vec::new();
+    let mut parser = XmlParser::from_reader(BufReader::new(file));
+    parser.config_mut().trim_text(true);
+    parser.config_mut().expand_empty_elements = true;
+
+    loop {
+      let xmlevent = parser.read_event_into(&mut buf).unwrap_or_else(|e| fatalerr!("Error: failed to parse XML at position {}: {}", parser.buffer_position(), e));
+      let event = match xmlevent {
+        XmlEvent::Decl(ref e) => {
+          if !settings.hush_version && !settings.hush_info {
+            eprintln!("Info: reading XML version {} with encoding {}",
+              str::from_utf8(&e.version().unwrap_or_else(|_| fatalerr!("Error: missing or invalid XML version attribute: {:#?}", e.as_ref()))).unwrap(),
+              str::from_utf8(match e.encoding() {
+                Some(Ok(Cow::Borrowed(encoding))) => encoding,
+                _ => b"unknown"
+              }).unwrap()
+            );
+          }
+          continue;
+        },
+        XmlEvent::Start(ref e) => {
+          let tag = parser.decoder().decode(e.name().as_ref()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML tag '{}': {}", String::from_utf8_lossy(e.name().as_ref()), err)).to_string();
+          let mut attributes = HashMap::new();
+          for res in e.attributes() {
+            match res {
+              Err(_) => (),
+              Ok(attr) => {
+                let key = parser.decoder().decode(attr.key.as_ref()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute name '{}': {}", String::from_utf8_lossy(e.name().as_ref()), err)).to_string();
+                let value = parser.decoder().decode(attr.value.as_ref()).unwrap_or_else(|err| fatalerr!("Error: failed to decode XML attribute name '{}': {}", String::from_utf8_lossy(e.name().as_ref()), err)).to_string();
+                attributes.insert(key, value);
+              }
+            }
+          }
+          Event::Start((tag, attributes))
+        },
+        XmlEvent::Text(ref e) => {
+          let value = e.unescape().unwrap_or_else(|err| fatalerr!("Error: failed to decode XML text node '{}': {}", String::from_utf8_lossy(e), err)).to_string();
+          Event::Value(value)
+        },
+        XmlEvent::End(_) => {
+          Event::End
+        }
+        XmlEvent::Eof => break,
+        _ => fatalerr!("Error: invalid event received from XML parser")
+      };
+      tx.send(event).expect("Error: channel reader went away");
+      buf.clear();
     }
   }
 }
